@@ -1,5 +1,4 @@
 import os
-import io
 import json
 import re
 import base64
@@ -9,7 +8,7 @@ from datetime import datetime
 from typing import Optional
 
 import anthropic
-from pypdf import PdfReader, PdfWriter
+import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
@@ -29,20 +28,6 @@ sessions: dict[str, dict] = {}
 class UpdateTransactionRequest(BaseModel):
     include: bool
     reason: Optional[str] = None
-
-
-def split_pdf_into_chunks(pdf_bytes: bytes, pages_per_chunk: int = 8) -> list[bytes]:
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    total = len(reader.pages)
-    chunks = []
-    for start in range(0, total, pages_per_chunk):
-        writer = PdfWriter()
-        for page_idx in range(start, min(start + pages_per_chunk, total)):
-            writer.add_page(reader.pages[page_idx])
-        buf = io.BytesIO()
-        writer.write(buf)
-        chunks.append(buf.getvalue())
-    return chunks
 
 
 def extract_balanced(text: str, open_ch: str, close_ch: str, start: int) -> tuple[int, int]:
@@ -624,17 +609,23 @@ async def analyze_statements(files: list[UploadFile] = File(...)):
         pdf_bytes = await file.read()
 
         try:
-            page_chunks = split_pdf_into_chunks(pdf_bytes, pages_per_chunk=8)
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            total_pages = len(doc)
         except Exception as e:
-            print(f"[WARN] Could not split {file.filename}: {e}")
-            page_chunks = [pdf_bytes]
+            raise HTTPException(status_code=400, detail=f"Could not open {file.filename}: {e}")
 
-        total_chunks = len(page_chunks)
-        print(f"[INFO] {file.filename}: {total_chunks} chunk(s)")
+        print(f"[INFO] {file.filename}: {total_pages} page(s)")
 
-        for idx, chunk_bytes in enumerate(page_chunks):
-            print(f"[INFO] Chunk {idx+1}/{total_chunks} — {file.filename}")
-            pdf_b64 = base64.standard_b64encode(chunk_bytes).decode("utf-8")
+        for page_idx in range(total_pages):
+            print(f"[INFO] Processing page {page_idx+1}/{total_pages} — {file.filename}")
+
+            try:
+                page = doc[page_idx]
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode("utf-8")
+            except Exception as e:
+                print(f"[WARN] Could not render page {page_idx+1} of {file.filename}: {e}")
+                continue
 
             with client.messages.stream(
                 model="claude-haiku-4-5-20251001",
@@ -642,8 +633,8 @@ async def analyze_statements(files: list[UploadFile] = File(...)):
                 messages=[{
                     "role": "user",
                     "content": [
-                        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64}},
-                        {"type": "text", "text": PROMPT + f"\n\n(Page chunk {idx+1} of {total_chunks})"},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+                        {"type": "text", "text": PROMPT + f"\n\n(Page {page_idx+1} of {total_pages})"},
                     ],
                 }],
             ) as stream:
@@ -652,7 +643,7 @@ async def analyze_statements(files: list[UploadFile] = File(...)):
             try:
                 raw = extract_json_transactions(response_text)
             except Exception as e:
-                print(f"[WARN] Parse error chunk {idx+1}: {e}")
+                print(f"[WARN] Parse error on page {page_idx+1}: {e}")
                 continue
 
             added = 0
@@ -661,7 +652,9 @@ async def analyze_statements(files: list[UploadFile] = File(...)):
                 tx["id"] = str(uuid.uuid4())
                 all_transactions.append(tx)
                 added += 1
-            print(f"[INFO] Chunk {idx+1}/{total_chunks}: {added} transactions extracted")
+            print(f"[INFO] Page {page_idx+1}/{total_pages}: {added} transactions found")
+
+        doc.close()
 
     session_id = str(uuid.uuid4())
     sessions[session_id] = {"transactions": all_transactions}
