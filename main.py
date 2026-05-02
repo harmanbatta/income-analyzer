@@ -620,12 +620,24 @@ async def analyze_statements(files: list[UploadFile] = File(...)):
             print(f"[INFO] Processing page {page_idx+1}/{total_pages} — {file.filename}")
 
             try:
-                page = doc[page_idx]
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode("utf-8")
-            except Exception as e:
-                print(f"[WARN] Could not render page {page_idx+1} of {file.filename}: {e}")
-                continue
+    page = doc[page_idx]
+    # Try text extraction first
+    page_text = page.get_text().strip()
+    if len(page_text) > 50:
+        # Text-based page — use text directly
+        content_blocks = [
+            {"type": "text", "text": PROMPT + f"\n\nPage {page_idx+1} of {total_pages}:\n\n{page_text}"}
+        ]
+    else:
+        # Scanned page — use image
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode("utf-8")
+        content_blocks = [
+           *content_blocks,
+        ]
+except Exception as e:
+    print(f"[WARN] Could not process page {page_idx+1} of {file.filename}: {e}")
+    continue
 
             with client.messages.stream(
                 model="claude-haiku-4-5-20251001",
