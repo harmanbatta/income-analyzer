@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import re
 import base64
 import tempfile
@@ -537,12 +538,16 @@ HTML = """<!DOCTYPE html>
   async function handleToggle(txId) {
     var tx = state.transactions.find(function(t){return t.id===txId;});
     if (!tx || state.updating[txId]) return;
+    var newInclude = !tx.include;
     var upd = Object.assign({},state.updating); upd[txId]=true;
-    setState({updating:upd});
+    var optimistic = state.transactions.map(function(t){
+      return t.id===txId ? Object.assign({},t,{include:newInclude}) : t;
+    });
+    setState({transactions:optimistic, updating:upd});
     try {
       var res = await fetch('/sessions/'+state.sessionId+'/transactions/'+txId,{
         method:'PUT', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({include:!tx.include})
+        body:JSON.stringify({include:newInclude})
       });
       if (!res.ok) throw new Error('Failed');
       var updated = await res.json();
@@ -550,8 +555,11 @@ HTML = """<!DOCTYPE html>
       var done = Object.assign({},state.updating); delete done[txId];
       setState({transactions:txs, updating:done});
     } catch(e) {
+      var reverted = state.transactions.map(function(t){
+        return t.id===txId ? Object.assign({},t,{include:tx.include}) : t;
+      });
       var done2 = Object.assign({},state.updating); delete done2[txId];
-      setState({updating:done2});
+      setState({transactions:reverted, updating:done2});
     }
   }
 
@@ -620,35 +628,29 @@ async def analyze_statements(files: list[UploadFile] = File(...)):
             print(f"[INFO] Processing page {page_idx+1}/{total_pages} — {file.filename}")
 
             try:
-    page = doc[page_idx]
-    # Try text extraction first
-    page_text = page.get_text().strip()
-    if len(page_text) > 50:
-        # Text-based page — use text directly
-        content_blocks = [
-            {"type": "text", "text": PROMPT + f"\n\nPage {page_idx+1} of {total_pages}:\n\n{page_text}"}
-        ]
-    else:
-        # Scanned page — use image
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-        img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode("utf-8")
-        content_blocks = [
-           *content_blocks,
-        ]
-except Exception as e:
-    print(f"[WARN] Could not process page {page_idx+1} of {file.filename}: {e}")
-    continue
+                page = doc[page_idx]
+                page_text = page.get_text().strip()
+                if len(page_text) >= 50:
+                    print(f"[INFO] Page {page_idx+1}: text mode ({len(page_text)} chars)")
+                    content = [
+                        {"type": "text", "text": PROMPT + f"\n\n(Page {page_idx+1} of {total_pages})\n\n{page_text}"},
+                    ]
+                else:
+                    print(f"[INFO] Page {page_idx+1}: image mode (text only {len(page_text)} chars)")
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode("utf-8")
+                    content = [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+                        {"type": "text", "text": PROMPT + f"\n\n(Page {page_idx+1} of {total_pages})"},
+                    ]
+            except Exception as e:
+                print(f"[WARN] Could not process page {page_idx+1} of {file.filename}: {e}")
+                continue
 
             with client.messages.stream(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=32000,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-                        {"type": "text", "text": PROMPT + f"\n\n(Page {page_idx+1} of {total_pages})"},
-                    ],
-                }],
+                messages=[{"role": "user", "content": content}],
             ) as stream:
                 response_text = stream.get_final_text().strip()
 
@@ -857,7 +859,9 @@ def export_excel(session_id: str):
         vc.font = Font(name="Arial",bold=True,size=10,color=("27AE60" if val>=0 else "E74C3C")) if "Net" in lbl else bold_font
         row += 1
 
-    ws.column_dimensions["A"].width = 24
+    # Autofit summary sheet column A based on longest category name
+    max_a = max((len(cat) for cat in income_cats + expense_cats), default=16)
+    ws.column_dimensions["A"].width = max(24, max_a + 2)
     for i in range(2, max(mx, 10)+1):
         ws.column_dimensions[get_column_letter(i)].width = 16
 
@@ -871,32 +875,54 @@ def export_excel(session_id: str):
         bc.fill = hdr_fill; bc.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         ws_b.merge_cells("A1:G1"); ws_b.row_dimensions[1].height = 36
 
-        hdrs = ["Date","Description","Amount","Month","Category","Include","Notes / Reason"]
-        widths = [14, 45, 14, 10, 26, 10, 50]
-        for ci, (h, w) in enumerate(zip(hdrs, widths), 1):
-            c = ws_b.cell(row=2, column=ci, value=h)
+        # col config: (header, wrap_width_cap, wrap)
+        col_cfg = [
+            ("Date",           12, False),
+            ("Description",    52, True),
+            ("Amount",         14, False),
+            ("Month",          10, False),
+            ("Category",       30, True),
+            ("Include",        10, False),
+            ("Notes / Reason", 55, True),
+        ]
+        col_widths = [len(cfg[0]) + 2 for cfg in col_cfg]
+
+        for ci, (hdr, _, _) in enumerate(col_cfg, 1):
+            c = ws_b.cell(row=2, column=ci, value=hdr)
             c.font = hdr_font; c.fill = hdr_fill
-            c.alignment = Alignment(horizontal="center", vertical="center"); c.border = thin
-            ws_b.column_dimensions[get_column_letter(ci)].width = w
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = thin
         ws_b.row_dimensions[2].height = 18
 
-        for ri, tx in enumerate(sorted(txs, key=lambda t: t.get("date","")), 3):
+        sorted_txs = sorted(txs, key=lambda t: t.get("date", ""))
+        for ri, tx in enumerate(sorted_txs, 3):
             inc = tx.get("include", True)
             rf = green_row if inc else orange_row
             vals = [tx.get("date",""), tx.get("description",""), abs(tx.get("amount",0)),
                     tx.get("month",""), tx.get("category",""), "Y" if inc else "N", tx.get("reason","")]
-            for ci, val in enumerate(vals, 1):
+            max_lines = 1
+            for ci, (val, (_, cap, wrap)) in enumerate(zip(vals, col_cfg), 1):
                 c = ws_b.cell(row=ri, column=ci, value=val); c.fill = rf; c.border = thin
+                str_val = str(val) if val not in (None, "") else ""
                 if ci == 3:
-                    c.font = norm_font; c.number_format = mfmt; c.alignment = Alignment(horizontal="right",vertical="center")
+                    c.font = norm_font; c.number_format = mfmt
+                    c.alignment = Alignment(horizontal="right", vertical="top")
                 elif ci == 6:
                     c.font = wb_font; c.fill = inc_y_fill if inc else inc_n_fill
-                    c.alignment = Alignment(horizontal="center",vertical="center")
-                elif ci == 7:
-                    c.font = norm_font; c.alignment = Alignment(vertical="center",wrap_text=True)
+                    c.alignment = Alignment(horizontal="center", vertical="top")
                 else:
-                    c.font = norm_font; c.alignment = Alignment(vertical="center")
-            ws_b.row_dimensions[ri].height = 15
+                    c.font = norm_font
+                    c.alignment = Alignment(vertical="top", wrap_text=wrap)
+                if str_val:
+                    effective_len = min(len(str_val), cap)
+                    col_widths[ci - 1] = max(col_widths[ci - 1], effective_len + 2)
+                    if wrap:
+                        lines = (len(str_val) + cap - 1) // cap
+                        max_lines = max(max_lines, lines)
+            ws_b.row_dimensions[ri].height = max(15, max_lines * 14)
+
+        for ci, (w, (_, cap, _)) in enumerate(zip(col_widths, col_cfg), 1):
+            ws_b.column_dimensions[get_column_letter(ci)].width = min(w, cap + 2)
 
     ws_inc = wb.create_sheet("Income Breakdown")
     build_sheet(ws_inc, income_txs)
