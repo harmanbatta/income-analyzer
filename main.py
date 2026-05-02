@@ -17,6 +17,8 @@ from pydantic import BaseModel
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.formatting.rule import CellIsRule
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 if not ANTHROPIC_API_KEY:
@@ -742,6 +744,11 @@ def export_excel(session_id: str):
     income_cats = sorted(set(tx.get("category", "") for tx in income_txs if tx.get("category")))
     expense_cats = sorted(set(tx.get("category", "") for tx in expense_txs if tx.get("category")))
 
+    n_inc = len(income_months) or 1
+    n_exp = len(expense_months) or 1
+    n_all = len(all_months) or 1
+
+    # ── Styles ────────────────────────────────────────────────────────────────
     green_row  = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
     orange_row = PatternFill(start_color="FFE0B2", end_color="FFE0B2", fill_type="solid")
     inc_y_fill = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
@@ -751,20 +758,25 @@ def export_excel(session_id: str):
     sub_fill   = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
     tot_fill   = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
     met_fill   = PatternFill(start_color="E8F0FE", end_color="E8F0FE", fill_type="solid")
+    net_pos    = PatternFill(start_color="E8F8E8", end_color="E8F8E8", fill_type="solid")
 
     hdr_font  = Font(name="Arial", color="FFFFFF", bold=True, size=10)
     sec_font  = Font(name="Arial", color="FFFFFF", bold=True, size=11)
     bold_font = Font(name="Arial", bold=True, size=10)
     norm_font = Font(name="Arial", size=10)
     wb_font   = Font(name="Arial", color="FFFFFF", bold=True, size=10)
+    net_p_fnt = Font(name="Arial", bold=True, size=10, color="27AE60")
+    net_n_fnt = Font(name="Arial", bold=True, size=10, color="E74C3C")
 
     thin = Border(left=Side(style="thin"), right=Side(style="thin"),
                   top=Side(style="thin"), bottom=Side(style="thin"))
     mfmt = "#,##0.00"
     pfmt = "0.0%"
+    MIN_H = 20
 
-    def autofit_columns(ws, min_width: int = 8, max_width: int = 60) -> None:
-        """Set column widths based on content and enable wrap text on all cells."""
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def autofit_columns(ws, min_width=8, max_width=60):
+        """Size columns from literal cell content; enable wrap text; enforce min row height."""
         col_widths: dict[int, int] = {}
         for row_cells in ws.iter_rows():
             for cell in row_cells:
@@ -776,20 +788,17 @@ def export_excel(session_id: str):
                         wrap_text=True,
                         indent=curr.indent,
                     )
-                    if cell.value is not None:
+                    if cell.value is not None and not str(cell.value).startswith("="):
                         col = cell.column
-                        lines = str(cell.value).split("\n")
-                        length = max(len(line) for line in lines) + 2
+                        length = max(len(ln) for ln in str(cell.value).split("\n")) + 2
                         col_widths[col] = max(col_widths.get(col, min_width), length)
                 except Exception:
                     pass
         for col, width in col_widths.items():
             ws.column_dimensions[get_column_letter(col)].width = min(max(width, min_width), max_width)
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Summary"
-    row = 1
+        for ri in ws.row_dimensions:
+            if (ws.row_dimensions[ri].height or 0) < MIN_H:
+                ws.row_dimensions[ri].height = MIN_H
 
     def sec_hdr(ws, r, text, ncols):
         c = ws.cell(row=r, column=1, value=text)
@@ -798,199 +807,356 @@ def export_excel(session_id: str):
         ws.row_dimensions[r].height = 22
         if ncols > 1:
             ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncols)
-        return r + 1
 
-    def col_hdrs(ws, r, hdrs):
-        for ci, h in enumerate(hdrs, 1):
+    def col_hdrs(ws, r, hdrs, start_col=1):
+        for ci, h in enumerate(hdrs, start_col):
             c = ws.cell(row=r, column=ci, value=h)
             c.font = hdr_font; c.fill = sub_fill
             c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             c.border = thin
-        ws.row_dimensions[r].height = 18
-        return r + 1
+        ws.row_dimensions[r].height = MIN_H
 
-    # Section 1 — Monthly Income
-    inc_cols = 1 + len(income_cats) + 1
-    row = sec_hdr(ws, row, "SECTION 1 — MONTHLY INCOME BREAKDOWN  (Y transactions only)", inc_cols)
-    row = col_hdrs(ws, row, ["Month"] + income_cats + ["Total Income"])
-    cat_inc_tot = {c: 0.0 for c in income_cats}
-    mon_inc_tot = {}
-    for mo in income_months:
-        mtxs = [t for t in income_txs if t.get("month") == mo and t.get("include", True)]
-        rd = [mo]; rt = 0.0
-        for cat in income_cats:
-            v = sum(abs(t.get("amount", 0)) for t in mtxs if t.get("category") == cat)
-            cat_inc_tot[cat] += v; rd.append(v or None); rt += v
-        rd.append(rt); mon_inc_tot[mo] = rt
-        for ci, val in enumerate(rd, 1):
-            c = ws.cell(row=row, column=ci, value=val); c.font = norm_font; c.border = thin
-            if ci == 1:
-                c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-            else:
-                c.number_format = mfmt; c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
-        row += 1
-    grand_inc = sum(mon_inc_tot.values()); n_inc = len(income_months) or 1
-    for lbl, vals in [("Grand Total", [cat_inc_tot[c] for c in income_cats] + [grand_inc]),
-                      ("Monthly Average", [cat_inc_tot[c] / n_inc for c in income_cats] + [grand_inc / n_inc])]:
-        for ci, val in enumerate([lbl] + vals, 1):
-            c = ws.cell(row=row, column=ci, value=val); c.font = bold_font; c.fill = tot_fill; c.border = thin
-            if ci == 1:
-                c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-            else:
-                c.number_format = mfmt; c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
-        row += 1
-    row += 1
+    def num_cell(ws, r, ci, formula, font=None, fill=None):
+        c = ws.cell(row=r, column=ci, value=formula)
+        c.font = font or norm_font; c.border = thin; c.number_format = mfmt
+        c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
+        if fill:
+            c.fill = fill
 
-    # Section 2 — Monthly Expenses
-    exp_cols = 1 + len(expense_cats) + 1
-    mx = max(inc_cols, exp_cols)
-    row = sec_hdr(ws, row, "SECTION 2 — MONTHLY EXPENSE BREAKDOWN  (Y transactions only)", mx)
-    row = col_hdrs(ws, row, ["Month"] + expense_cats + ["Total Expenses"])
-    cat_exp_tot = {c: 0.0 for c in expense_cats}
-    mon_exp_tot = {}
-    for mo in expense_months:
-        mtxs = [t for t in expense_txs if t.get("month") == mo and t.get("include", True)]
-        rd = [mo]; rt = 0.0
-        for cat in expense_cats:
-            v = sum(abs(t.get("amount", 0)) for t in mtxs if t.get("category") == cat)
-            cat_exp_tot[cat] += v; rd.append(v or None); rt += v
-        rd.append(rt); mon_exp_tot[mo] = rt
-        for ci, val in enumerate(rd, 1):
-            c = ws.cell(row=row, column=ci, value=val); c.font = norm_font; c.border = thin
-            if ci == 1:
-                c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-            else:
-                c.number_format = mfmt; c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
-        row += 1
-    grand_exp = sum(mon_exp_tot.values()); n_exp = len(expense_months) or 1
-    for lbl, vals in [("Grand Total", [cat_exp_tot[c] for c in expense_cats] + [grand_exp]),
-                      ("Monthly Average", [cat_exp_tot[c] / n_exp for c in expense_cats] + [grand_exp / n_exp])]:
-        for ci, val in enumerate([lbl] + vals, 1):
-            c = ws.cell(row=row, column=ci, value=val); c.font = bold_font; c.fill = tot_fill; c.border = thin
-            if ci == 1:
-                c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-            else:
-                c.number_format = mfmt; c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
-        row += 1
-    row += 1
+    def lbl_cell(ws, r, ci, text, font=None, fill=None):
+        c = ws.cell(row=r, column=ci, value=text)
+        c.font = font or norm_font; c.border = thin
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        if fill:
+            c.fill = fill
 
-    # Section 3 — Annual Category Totals
-    row = sec_hdr(ws, row, "SECTION 3 — ANNUAL CATEGORY TOTALS", max(mx, 9))
-    for ci, h in enumerate(["Category", "Annual Total", "% of Total Income", "Include Status"], 1):
-        c = ws.cell(row=row, column=ci, value=h); c.font = hdr_font; c.fill = sub_fill
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True); c.border = thin
-    for ci, h in enumerate(["Category", "Annual Total", "% of Total Expenses", "Include Status"], 6):
-        c = ws.cell(row=row, column=ci, value=h); c.font = hdr_font; c.fill = sub_fill
-        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True); c.border = thin
-    row += 1
+    # ── Breakdown sheet column layout (A–G) ──────────────────────────────────
+    # A=Date  B=Description  C=Amount  D=Month  E=Category  F=Include  G=Reason
+    # Data starts at row 3 (row 1 = banner, row 2 = headers)
+    BD_DATA_START = 3
+    BD_MAX_ROW = 2000   # fixed range ceiling for SUMPRODUCT formulas
 
-    def has_included(txs, cat):
-        return any(t.get("include", True) for t in txs if t.get("category") == cat)
+    INC_SHEET = "Income Breakdown"
+    EXP_SHEET = "Expense Breakdown"
 
-    for r in range(max(len(income_cats), len(expense_cats), 1)):
-        if r < len(income_cats):
-            cat = income_cats[r]; tot = cat_inc_tot[cat]
-            pct = tot / grand_inc if grand_inc else 0.0
-            st = "Y" if has_included(income_txs, cat) else "N"
-            for ci, val in enumerate([cat, tot, pct, st], 1):
-                c = ws.cell(row=row + r, column=ci, value=val); c.border = thin
-                if ci == 1:
-                    c.font = norm_font; c.alignment = Alignment(wrap_text=True)
-                elif ci == 2:
-                    c.font = norm_font; c.number_format = mfmt
-                    c.alignment = Alignment(horizontal="right", wrap_text=True)
-                elif ci == 3:
-                    c.font = norm_font; c.number_format = pfmt
-                    c.alignment = Alignment(horizontal="right", wrap_text=True)
-                else:
-                    c.font = wb_font; c.fill = inc_y_fill if st == "Y" else inc_n_fill
-                    c.alignment = Alignment(horizontal="center", wrap_text=True)
-        if r < len(expense_cats):
-            cat = expense_cats[r]; tot = cat_exp_tot[cat]
-            pct = tot / grand_exp if grand_exp else 0.0
-            st = "Y" if has_included(expense_txs, cat) else "N"
-            for ci, val in enumerate([cat, tot, pct, st], 6):
-                c = ws.cell(row=row + r, column=ci, value=val); c.border = thin
-                if ci == 6:
-                    c.font = norm_font; c.alignment = Alignment(wrap_text=True)
-                elif ci == 7:
-                    c.font = norm_font; c.number_format = mfmt
-                    c.alignment = Alignment(horizontal="right", wrap_text=True)
-                elif ci == 8:
-                    c.font = norm_font; c.number_format = pfmt
-                    c.alignment = Alignment(horizontal="right", wrap_text=True)
-                else:
-                    c.font = wb_font; c.fill = inc_y_fill if st == "Y" else inc_n_fill
-                    c.alignment = Alignment(horizontal="center", wrap_text=True)
-    row += max(len(income_cats), len(expense_cats), 1) + 1
+    def sp(sheet, col, r1=BD_DATA_START, r2=BD_MAX_ROW):
+        """Absolute fixed-range reference for SUMPRODUCT: 'Sheet'!$X$r1:$X$r2"""
+        return f"'{sheet}'!${col}${r1}:${col}${r2}"
 
-    # Section 4 — Key Metrics
-    row = sec_hdr(ws, row, "SECTION 4 — KEY METRICS", 4)
-    n_all = len(all_months) or 1
-    net = grand_inc - grand_exp
-    for lbl, val in [("Total Annual Income", grand_inc), ("Total Annual Expenses", grand_exp),
-                     ("Net Annual Income", net), ("Monthly Average Income", grand_inc / n_all),
-                     ("Monthly Average Expenses", grand_exp / n_all),
-                     ("Monthly Average Net Income", net / n_all)]:
-        lc = ws.cell(row=row, column=1, value=lbl)
-        vc = ws.cell(row=row, column=2, value=val)
-        lc.font = bold_font; lc.fill = met_fill; lc.border = thin
-        lc.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-        vc.fill = met_fill; vc.border = thin; vc.number_format = mfmt
+    def sumproduct_cat_month(sheet, cat, month):
+        return (
+            f"=SUMPRODUCT("
+            f"({sp(sheet,'E')}=\"{cat}\")*"
+            f"({sp(sheet,'D')}=\"{month}\")*"
+            f"({sp(sheet,'F')}=\"Y\")*"
+            f"{sp(sheet,'C')})"
+        )
+
+    def sumproduct_cat_annual(sheet, cat):
+        return (
+            f"=SUMPRODUCT("
+            f"({sp(sheet,'E')}=\"{cat}\")*"
+            f"({sp(sheet,'F')}=\"Y\")*"
+            f"{sp(sheet,'C')})"
+        )
+
+    def sumproduct_cat_has_y(sheet, cat):
+        return (
+            f"=IF(SUMPRODUCT("
+            f"({sp(sheet,'E')}=\"{cat}\")*"
+            f"({sp(sheet,'F')}=\"Y\"))>0,\"Y\",\"N\")"
+        )
+
+    # ── Summary sheet row layout ──────────────────────────────────────────────
+    # Section 1 (Monthly Income)
+    S1_HDR        = 1
+    S1_COLHDR     = 2
+    S1_DATA_START = 3
+    S1_DATA_END   = S1_DATA_START + max(len(income_months), 1) - 1
+    S1_GRAND      = S1_DATA_END + 1
+    S1_AVG        = S1_GRAND + 1
+
+    # Section 2 (Monthly Expenses)
+    S2_HDR        = S1_AVG + 2
+    S2_COLHDR     = S2_HDR + 1
+    S2_DATA_START = S2_COLHDR + 1
+    S2_DATA_END   = S2_DATA_START + max(len(expense_months), 1) - 1
+    S2_GRAND      = S2_DATA_END + 1
+    S2_AVG        = S2_GRAND + 1
+
+    # Section 3 (Annual Category Totals)
+    S3_HDR        = S2_AVG + 2
+    S3_COLHDR     = S3_HDR + 1
+    S3_DATA_START = S3_COLHDR + 1
+    n_cat_rows    = max(len(income_cats), len(expense_cats), 1)
+    S3_DATA_END   = S3_DATA_START + n_cat_rows - 1
+
+    # Section 4 (Key Metrics)
+    S4_HDR        = S3_DATA_END + 2
+    S4_DATA_START = S4_HDR + 1
+
+    # Summary column counts
+    # Section 1/2: col 1=Month, cols 2..1+n_cats=categories, col 2+n_cats=Total
+    inc_total_col = len(income_cats) + 2   # "Total Income" column index
+    exp_total_col = len(expense_cats) + 2  # "Total Expenses" column index
+    max_data_cols = max(inc_total_col, exp_total_col, 9)
+
+    # Key cell references used across sections
+    inc_grand_ref = f"{get_column_letter(inc_total_col)}{S1_GRAND}"
+    exp_grand_ref = f"{get_column_letter(exp_total_col)}{S2_GRAND}"
+
+    # ── Build Workbook ────────────────────────────────────────────────────────
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Summary"
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 1 — Monthly Income Breakdown
+    # ════════════════════════════════════════════════════════════════════════
+    sec_hdr(ws, S1_HDR, "SECTION 1 — MONTHLY INCOME BREAKDOWN  (Y transactions only)", inc_total_col)
+    col_hdrs(ws, S1_COLHDR, ["Month"] + income_cats + ["Total Income"])
+
+    for mi, mo in enumerate(income_months):
+        r = S1_DATA_START + mi
+        lbl_cell(ws, r, 1, mo)
+        for ci, cat in enumerate(income_cats, 2):
+            num_cell(ws, r, ci, sumproduct_cat_month(INC_SHEET, cat, mo))
+        # Total Income = SUM of category cells in this row
+        if income_cats:
+            tot_f = f"=SUM({get_column_letter(2)}{r}:{get_column_letter(1+len(income_cats))}{r})"
+        else:
+            tot_f = "=0"
+        num_cell(ws, r, inc_total_col, tot_f)
+        ws.row_dimensions[r].height = MIN_H
+
+    if not income_months:
+        ws.cell(row=S1_DATA_START, column=1, value="(no income data)").font = norm_font
+
+    # Grand Total row — SUM each column over all data rows
+    lbl_cell(ws, S1_GRAND, 1, "Grand Total", bold_font, tot_fill)
+    for ci in range(2, inc_total_col + 1):
+        cl = get_column_letter(ci)
+        num_cell(ws, S1_GRAND, ci, f"=SUM({cl}{S1_DATA_START}:{cl}{S1_DATA_END})", bold_font, tot_fill)
+    ws.row_dimensions[S1_GRAND].height = MIN_H
+
+    # Monthly Average row — Grand Total / n_inc
+    lbl_cell(ws, S1_AVG, 1, "Monthly Average", bold_font, tot_fill)
+    for ci in range(2, inc_total_col + 1):
+        cl = get_column_letter(ci)
+        num_cell(ws, S1_AVG, ci, f"={cl}{S1_GRAND}/{n_inc}", bold_font, tot_fill)
+    ws.row_dimensions[S1_AVG].height = MIN_H
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 2 — Monthly Expense Breakdown
+    # ════════════════════════════════════════════════════════════════════════
+    sec_hdr(ws, S2_HDR, "SECTION 2 — MONTHLY EXPENSE BREAKDOWN  (Y transactions only)", exp_total_col)
+    col_hdrs(ws, S2_COLHDR, ["Month"] + expense_cats + ["Total Expenses"])
+
+    for mi, mo in enumerate(expense_months):
+        r = S2_DATA_START + mi
+        lbl_cell(ws, r, 1, mo)
+        for ci, cat in enumerate(expense_cats, 2):
+            num_cell(ws, r, ci, sumproduct_cat_month(EXP_SHEET, cat, mo))
+        if expense_cats:
+            tot_f = f"=SUM({get_column_letter(2)}{r}:{get_column_letter(1+len(expense_cats))}{r})"
+        else:
+            tot_f = "=0"
+        num_cell(ws, r, exp_total_col, tot_f)
+        ws.row_dimensions[r].height = MIN_H
+
+    if not expense_months:
+        ws.cell(row=S2_DATA_START, column=1, value="(no expense data)").font = norm_font
+
+    lbl_cell(ws, S2_GRAND, 1, "Grand Total", bold_font, tot_fill)
+    for ci in range(2, exp_total_col + 1):
+        cl = get_column_letter(ci)
+        num_cell(ws, S2_GRAND, ci, f"=SUM({cl}{S2_DATA_START}:{cl}{S2_DATA_END})", bold_font, tot_fill)
+    ws.row_dimensions[S2_GRAND].height = MIN_H
+
+    lbl_cell(ws, S2_AVG, 1, "Monthly Average", bold_font, tot_fill)
+    for ci in range(2, exp_total_col + 1):
+        cl = get_column_letter(ci)
+        num_cell(ws, S2_AVG, ci, f"={cl}{S2_GRAND}/{n_exp}", bold_font, tot_fill)
+    ws.row_dimensions[S2_AVG].height = MIN_H
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 3 — Annual Category Totals
+    # ════════════════════════════════════════════════════════════════════════
+    # Income cols 1-4, spacer col 5, Expense cols 6-9
+    sec_hdr(ws, S3_HDR, "SECTION 3 — ANNUAL CATEGORY TOTALS", max(max_data_cols, 9))
+    col_hdrs(ws, S3_COLHDR, ["Category", "Annual Total", "% of Total Income", "Include Status"], 1)
+    col_hdrs(ws, S3_COLHDR, ["Category", "Annual Total", "% of Total Expenses", "Include Status"], 6)
+
+    for idx in range(n_cat_rows):
+        r = S3_DATA_START + idx
+        ws.row_dimensions[r].height = MIN_H
+
+        # ── Income side (cols 1-4) ──
+        if idx < len(income_cats):
+            cat = income_cats[idx]
+            has_y = any(t.get("include", True) for t in income_txs if t.get("category") == cat)
+
+            c1 = ws.cell(row=r, column=1, value=cat)
+            c1.font = norm_font; c1.border = thin
+            c1.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+            c2 = ws.cell(row=r, column=2, value=sumproduct_cat_annual(INC_SHEET, cat))
+            c2.font = norm_font; c2.border = thin; c2.number_format = mfmt
+            c2.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
+
+            c3 = ws.cell(row=r, column=3,
+                         value=f"=IF({inc_grand_ref}<>0,B{r}/{inc_grand_ref},0)")
+            c3.font = norm_font; c3.border = thin; c3.number_format = pfmt
+            c3.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
+
+            c4 = ws.cell(row=r, column=4, value=sumproduct_cat_has_y(INC_SHEET, cat))
+            c4.font = wb_font; c4.fill = inc_y_fill if has_y else inc_n_fill
+            c4.border = thin
+            c4.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        # ── Expense side (cols 6-9) ──
+        if idx < len(expense_cats):
+            cat = expense_cats[idx]
+            has_y = any(t.get("include", True) for t in expense_txs if t.get("category") == cat)
+
+            c6 = ws.cell(row=r, column=6, value=cat)
+            c6.font = norm_font; c6.border = thin
+            c6.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+            c7 = ws.cell(row=r, column=7, value=sumproduct_cat_annual(EXP_SHEET, cat))
+            c7.font = norm_font; c7.border = thin; c7.number_format = mfmt
+            c7.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
+
+            c8 = ws.cell(row=r, column=8,
+                         value=f"=IF({exp_grand_ref}<>0,G{r}/{exp_grand_ref},0)")
+            c8.font = norm_font; c8.border = thin; c8.number_format = pfmt
+            c8.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
+
+            c9 = ws.cell(row=r, column=9, value=sumproduct_cat_has_y(EXP_SHEET, cat))
+            c9.font = wb_font; c9.fill = inc_y_fill if has_y else inc_n_fill
+            c9.border = thin
+            c9.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # Conditional formatting: Include Status cells update color when formula flips Y↔N
+    s3_inc_rng = f"D{S3_DATA_START}:D{S3_DATA_END}"
+    s3_exp_rng = f"I{S3_DATA_START}:I{S3_DATA_END}"
+    for rng in (s3_inc_rng, s3_exp_rng):
+        ws.conditional_formatting.add(rng,
+            CellIsRule(operator="equal", formula=['"Y"'], fill=inc_y_fill, font=wb_font))
+        ws.conditional_formatting.add(rng,
+            CellIsRule(operator="equal", formula=['"N"'], fill=inc_n_fill, font=wb_font))
+
+    # ════════════════════════════════════════════════════════════════════════
+    # SECTION 4 — Key Metrics (all cell-reference formulas)
+    # ════════════════════════════════════════════════════════════════════════
+    sec_hdr(ws, S4_HDR, "SECTION 4 — KEY METRICS", 4)
+
+    metrics = [
+        ("Total Annual Income",       f"={inc_grand_ref}",                           False),
+        ("Total Annual Expenses",     f"={exp_grand_ref}",                           False),
+        ("Net Annual Income",         f"={inc_grand_ref}-{exp_grand_ref}",           True),
+        ("Monthly Average Income",    f"={inc_grand_ref}/{n_inc}",                   False),
+        ("Monthly Average Expenses",  f"={exp_grand_ref}/{n_exp}",                   False),
+        ("Monthly Average Net Income",f"=({inc_grand_ref}-{exp_grand_ref})/{n_all}", True),
+    ]
+    for i, (lbl, formula, is_net) in enumerate(metrics):
+        r = S4_DATA_START + i
+        lbl_cell(ws, r, 1, lbl, bold_font, met_fill)
+        vc = ws.cell(row=r, column=2, value=formula)
+        vc.fill = met_fill; vc.border = thin; vc.number_format = mfmt; vc.font = bold_font
         vc.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
-        vc.font = Font(name="Arial", bold=True, size=10, color=("27AE60" if val >= 0 else "E74C3C")) \
-            if "Net" in lbl else bold_font
-        row += 1
+        ws.row_dimensions[r].height = MIN_H
+
+    # Conditional formatting for Net rows: green ≥ 0, red < 0
+    for i in (2, 5):   # Net Annual Income and Monthly Average Net Income
+        nc = f"B{S4_DATA_START + i}"
+        ws.conditional_formatting.add(nc, CellIsRule(
+            operator="greaterThanOrEqual", formula=["0"], fill=net_pos, font=net_p_fnt))
+        ws.conditional_formatting.add(nc, CellIsRule(
+            operator="lessThan", formula=["0"], fill=met_fill, font=net_n_fnt))
 
     autofit_columns(ws)
 
-    # Breakdown sheet builder
-    def build_sheet(ws_b, txs):
-        banner = ("GREEN rows (Y) are counted in summary totals.  "
-                  "ORANGE rows (N) are excluded but visible for reference.  "
-                  "Change Include in the Review screen before re-exporting.")
+    # ════════════════════════════════════════════════════════════════════════
+    # BREAKDOWN SHEETS (Income Breakdown + Expense Breakdown)
+    # Columns: A=Date  B=Description  C=Amount  D=Month  E=Category
+    #          F=Include (Y/N dropdown)  G=Notes/Reason
+    # ════════════════════════════════════════════════════════════════════════
+    def build_breakdown_sheet(ws_b, txs):
+        banner = (
+            "GREEN rows (Y) are counted in Summary totals.  "
+            "ORANGE rows (N) are excluded but visible for reference.  "
+            "Change the Include dropdown (F column) to Y or N — "
+            "the Summary sheet will recalculate automatically."
+        )
         bc = ws_b.cell(row=1, column=1, value=banner)
         bc.font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
         bc.fill = hdr_fill
         bc.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         ws_b.merge_cells("A1:G1")
-        ws_b.row_dimensions[1].height = 36
+        ws_b.row_dimensions[1].height = 40
 
-        hdrs = ["Date", "Description", "Amount", "Month", "Category", "Include", "Notes / Reason"]
-        for ci, h in enumerate(hdrs, 1):
+        for ci, h in enumerate(
+            ["Date", "Description", "Amount", "Month", "Category", "Include", "Notes / Reason"], 1
+        ):
             c = ws_b.cell(row=2, column=ci, value=h)
             c.font = hdr_font; c.fill = hdr_fill
             c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             c.border = thin
-        ws_b.row_dimensions[2].height = 18
+        ws_b.row_dimensions[2].height = MIN_H
 
-        for ri, tx in enumerate(sorted(txs, key=lambda t: t.get("date", "")), 3):
+        sorted_txs = sorted(txs, key=lambda t: t.get("date", ""))
+
+        for ri, tx in enumerate(sorted_txs, BD_DATA_START):
             inc = tx.get("include", True)
             rf = green_row if inc else orange_row
-            vals = [tx.get("date", ""), tx.get("description", ""), abs(tx.get("amount", 0)),
-                    tx.get("month", ""), tx.get("category", ""), "Y" if inc else "N", tx.get("reason", "")]
+            vals = [
+                tx.get("date", ""),
+                tx.get("description", ""),
+                abs(tx.get("amount", 0)),
+                tx.get("month", ""),
+                tx.get("category", ""),
+                "Y" if inc else "N",
+                tx.get("reason", ""),
+            ]
             for ci, val in enumerate(vals, 1):
-                c = ws_b.cell(row=ri, column=ci, value=val); c.fill = rf; c.border = thin
-                if ci == 3:
+                c = ws_b.cell(row=ri, column=ci, value=val)
+                c.fill = rf; c.border = thin
+                if ci == 3:      # Amount
                     c.font = norm_font; c.number_format = mfmt
                     c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
-                elif ci == 6:
-                    c.font = wb_font; c.fill = inc_y_fill if inc else inc_n_fill
+                elif ci == 6:    # Include — green/red cell
+                    c.font = wb_font
+                    c.fill = inc_y_fill if inc else inc_n_fill
                     c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                elif ci == 7:
+                elif ci == 7:    # Reason
                     c.font = norm_font
                     c.alignment = Alignment(vertical="center", wrap_text=True)
                 else:
                     c.font = norm_font
                     c.alignment = Alignment(vertical="center", wrap_text=True)
-            ws_b.row_dimensions[ri].height = 15
+            ws_b.row_dimensions[ri].height = MIN_H
+
+        # Y/N dropdown on Include column (F), covering all data rows plus spare rows
+        dv_last = max(len(sorted_txs) + BD_DATA_START + 50, BD_MAX_ROW)
+        dv = DataValidation(
+            type="list",
+            formula1='"Y,N"',
+            allow_blank=False,
+            showDropDown=False,      # False = show the dropdown arrow in Excel
+            showErrorMessage=True,
+            error="Enter Y or N",
+            errorTitle="Invalid value",
+        )
+        dv.sqref = f"F{BD_DATA_START}:F{dv_last}"
+        ws_b.add_data_validation(dv)
 
         autofit_columns(ws_b)
 
-    ws_inc = wb.create_sheet("Income Breakdown")
-    build_sheet(ws_inc, income_txs)
-    ws_exp = wb.create_sheet("Expense Breakdown")
-    build_sheet(ws_exp, expense_txs)
+    ws_inc = wb.create_sheet(INC_SHEET)
+    build_breakdown_sheet(ws_inc, income_txs)
+    ws_exp = wb.create_sheet(EXP_SHEET)
+    build_breakdown_sheet(ws_exp, expense_txs)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         tmp_path = tmp.name
