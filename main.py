@@ -4,6 +4,7 @@ import re
 import base64
 import tempfile
 import uuid
+from collections import Counter
 from datetime import datetime
 from typing import Optional
 
@@ -114,6 +115,26 @@ def normalize_transaction(tx: dict) -> dict:
     tx.setdefault("reason", "")
     tx.setdefault("month", "")
     return tx
+
+
+def deduplicate_categories(transactions: list) -> list:
+    """Post-processing pass: normalize inconsistent category/include for same description+type."""
+    key_cats: dict = {}
+    key_incs: dict = {}
+    for tx in transactions:
+        key = (tx.get("description", "").strip().lower(), tx.get("type", ""))
+        if key not in key_cats:
+            key_cats[key] = Counter()
+            key_incs[key] = Counter()
+        key_cats[key][tx.get("category", "")] += 1
+        key_incs[key][tx.get("include", True)] += 1
+    canonical_cat = {k: v.most_common(1)[0][0] for k, v in key_cats.items()}
+    canonical_inc = {k: v.most_common(1)[0][0] for k, v in key_incs.items()}
+    for tx in transactions:
+        key = (tx.get("description", "").strip().lower(), tx.get("type", ""))
+        tx["category"] = canonical_cat[key]
+        tx["include"] = canonical_inc[key]
+    return transactions
 
 
 PROMPT = """MORTGAGE UNDERWRITING — BANK STATEMENT INCOME & EXPENSE ANALYSIS
@@ -340,9 +361,9 @@ HTML = """<!DOCTYPE html>
       '<div class="bg-white border-b border-gray-200 px-6 py-4">' +
         '<div class="max-w-7xl mx-auto grid grid-cols-2 sm:grid-cols-4 gap-4">' +
           sc('#','Transactions',totals.includedCount+' / '+totals.count,'included','blue') +
-          sc('&uarr;','Total Income',fmt(totals.income),'included only','green') +
-          sc('&darr;','Total Expenses',fmt(totals.expenses),'included only','orange') +
-          sc('$','Net Income',fmt(totals.net),'income minus expenses',totals.net>=0?'green':'red') +
+          sc('&uarr;','Total Annual Income',fmt(totals.income),'included only','green') +
+          sc('&darr;','Total Annual Expenses',fmt(totals.expenses),'included only','orange') +
+          sc('$','Net Annual Income',fmt(totals.net),'income minus expenses',totals.net>=0?'green':'red') +
         '</div>' +
       '</div>' +
       '<div class="bg-white border-b border-gray-200 px-6 py-3">' +
@@ -409,17 +430,17 @@ HTML = """<!DOCTYPE html>
           '<div class="bg-gray-900 px-6 py-4"><h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Underwriting Summary</h2></div>' +
           '<div class="divide-y divide-gray-100">' +
             '<div class="flex items-center justify-between px-6 py-4">' +
-              '<div class="flex items-center gap-3"><div class="w-10 h-10 rounded-xl bg-green-100 text-green-600 flex items-center justify-center font-bold">&uarr;</div><p class="text-sm font-medium text-gray-700">Total Income</p></div>' +
+              '<div class="flex items-center gap-3"><div class="w-10 h-10 rounded-xl bg-green-100 text-green-600 flex items-center justify-center font-bold">&uarr;</div><p class="text-sm font-medium text-gray-700">Total Annual Income</p></div>' +
               '<span class="text-xl font-bold text-green-600">' + fmt(totalIncome) + '</span>' +
             '</div>' +
             '<div class="flex items-center justify-between px-6 py-4">' +
-              '<div class="flex items-center gap-3"><div class="w-10 h-10 rounded-xl bg-orange-100 text-orange-500 flex items-center justify-center font-bold">&darr;</div><p class="text-sm font-medium text-gray-700">Total Expenses</p></div>' +
+              '<div class="flex items-center gap-3"><div class="w-10 h-10 rounded-xl bg-orange-100 text-orange-500 flex items-center justify-center font-bold">&darr;</div><p class="text-sm font-medium text-gray-700">Total Annual Expenses</p></div>' +
               '<span class="text-xl font-bold text-orange-500">' + fmt(totalExpenses) + '</span>' +
             '</div>' +
             '<div class="flex items-center justify-between px-6 py-4 bg-gray-50">' +
               '<div class="flex items-center gap-3">' +
                 '<div class="w-10 h-10 rounded-xl flex items-center justify-center font-bold ' + (net>=0?'bg-green-100 text-green-700':'bg-red-100 text-red-600') + '">$</div>' +
-                '<div><p class="text-xs text-gray-400 font-medium uppercase tracking-wide">Net Income</p><p class="text-xs text-gray-400">Income minus Expenses</p></div>' +
+                '<div><p class="text-xs text-gray-400 font-medium uppercase tracking-wide">Net Annual Income</p><p class="text-xs text-gray-400">Income minus Expenses</p></div>' +
               '</div>' +
               '<span class="text-2xl font-bold ' + netColor + '">' + fmt(net) + '</span>' +
             '</div>' +
@@ -537,12 +558,19 @@ HTML = """<!DOCTYPE html>
   async function handleToggle(txId) {
     var tx = state.transactions.find(function(t){return t.id===txId;});
     if (!tx || state.updating[txId]) return;
+    var newInclude = !tx.include;
+
+    // Optimistic update: flip include immediately so totals update in real time
+    var optimisticTxs = state.transactions.map(function(t){
+      return t.id===txId ? Object.assign({},t,{include:newInclude}) : t;
+    });
     var upd = Object.assign({},state.updating); upd[txId]=true;
-    setState({updating:upd});
+    setState({transactions:optimisticTxs, updating:upd});
+
     try {
       var res = await fetch('/sessions/'+state.sessionId+'/transactions/'+txId,{
         method:'PUT', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({include:!tx.include})
+        body:JSON.stringify({include:newInclude})
       });
       if (!res.ok) throw new Error('Failed');
       var updated = await res.json();
@@ -550,8 +578,12 @@ HTML = """<!DOCTYPE html>
       var done = Object.assign({},state.updating); delete done[txId];
       setState({transactions:txs, updating:done});
     } catch(e) {
+      // Revert optimistic update on failure
+      var revertTxs = state.transactions.map(function(t){
+        return t.id===txId ? Object.assign({},t,{include:!newInclude}) : t;
+      });
       var done2 = Object.assign({},state.updating); delete done2[txId];
-      setState({updating:done2});
+      setState({transactions:revertTxs, updating:done2});
     }
   }
 
@@ -619,39 +651,38 @@ async def analyze_statements(files: list[UploadFile] = File(...)):
         for page_idx in range(total_pages):
             print(f"[INFO] Processing page {page_idx+1}/{total_pages} — {file.filename}")
 
+            # Build content blocks for this page (text or image fallback)
             try:
-    page = doc[page_idx]
-    # Try text extraction first
-    page_text = page.get_text().strip()
-    if len(page_text) > 50:
-        # Text-based page — use text directly
-        content_blocks = [
-            {"type": "text", "text": PROMPT + f"\n\nPage {page_idx+1} of {total_pages}:\n\n{page_text}"}
-        ]
-    else:
-        # Scanned page — use image
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-        img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode("utf-8")
-        content_blocks = [
-           *content_blocks,
-        ]
-except Exception as e:
-    print(f"[WARN] Could not process page {page_idx+1} of {file.filename}: {e}")
-    continue
-
-            with client.messages.stream(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=32000,
-                messages=[{
-                    "role": "user",
-                    "content": [
+                page = doc[page_idx]
+                page_text = page.get_text().strip()
+                if len(page_text) > 50:
+                    content_blocks = [
+                        {"type": "text", "text": PROMPT + f"\n\nPage {page_idx+1} of {total_pages}:\n\n{page_text}"}
+                    ]
+                else:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode("utf-8")
+                    content_blocks = [
                         {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
                         {"type": "text", "text": PROMPT + f"\n\n(Page {page_idx+1} of {total_pages})"},
-                    ],
-                }],
-            ) as stream:
-                response_text = stream.get_final_text().strip()
+                    ]
+            except Exception as e:
+                print(f"[WARN] Could not process page {page_idx+1} of {file.filename}: {e}")
+                continue
 
+            # Call Claude API
+            try:
+                with client.messages.stream(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=32000,
+                    messages=[{"role": "user", "content": content_blocks}],
+                ) as stream:
+                    response_text = stream.get_final_text().strip()
+            except Exception as e:
+                print(f"[WARN] API error on page {page_idx+1} of {file.filename}: {e}")
+                continue
+
+            # Parse transactions from response
             try:
                 raw = extract_json_transactions(response_text)
             except Exception as e:
@@ -667,6 +698,10 @@ except Exception as e:
             print(f"[INFO] Page {page_idx+1}/{total_pages}: {added} transactions found")
 
         doc.close()
+
+    # Post-processing: normalize inconsistent category/include across all pages and files
+    if all_transactions:
+        all_transactions = deduplicate_categories(all_transactions)
 
     session_id = str(uuid.uuid4())
     sessions[session_id] = {"transactions": all_transactions}
@@ -701,21 +736,21 @@ def export_excel(session_id: str):
         except Exception:
             return datetime.min
 
-    all_months = sorted(set(tx.get("month","") for tx in transactions if tx.get("month")), key=parse_month)
-    income_months = sorted(set(tx.get("month","") for tx in income_txs if tx.get("month")), key=parse_month)
-    expense_months = sorted(set(tx.get("month","") for tx in expense_txs if tx.get("month")), key=parse_month)
-    income_cats = sorted(set(tx.get("category","") for tx in income_txs if tx.get("category")))
-    expense_cats = sorted(set(tx.get("category","") for tx in expense_txs if tx.get("category")))
+    all_months = sorted(set(tx.get("month", "") for tx in transactions if tx.get("month")), key=parse_month)
+    income_months = sorted(set(tx.get("month", "") for tx in income_txs if tx.get("month")), key=parse_month)
+    expense_months = sorted(set(tx.get("month", "") for tx in expense_txs if tx.get("month")), key=parse_month)
+    income_cats = sorted(set(tx.get("category", "") for tx in income_txs if tx.get("category")))
+    expense_cats = sorted(set(tx.get("category", "") for tx in expense_txs if tx.get("category")))
 
-    green_row   = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-    orange_row  = PatternFill(start_color="FFE0B2", end_color="FFE0B2", fill_type="solid")
-    inc_y_fill  = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
-    inc_n_fill  = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-    hdr_fill    = PatternFill(start_color="1E3A5F", end_color="1E3A5F", fill_type="solid")
-    sec_fill    = PatternFill(start_color="2E75B6", end_color="2E75B6", fill_type="solid")
-    sub_fill    = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
-    tot_fill    = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
-    met_fill    = PatternFill(start_color="E8F0FE", end_color="E8F0FE", fill_type="solid")
+    green_row  = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    orange_row = PatternFill(start_color="FFE0B2", end_color="FFE0B2", fill_type="solid")
+    inc_y_fill = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
+    inc_n_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+    hdr_fill   = PatternFill(start_color="1E3A5F", end_color="1E3A5F", fill_type="solid")
+    sec_fill   = PatternFill(start_color="2E75B6", end_color="2E75B6", fill_type="solid")
+    sub_fill   = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+    tot_fill   = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+    met_fill   = PatternFill(start_color="E8F0FE", end_color="E8F0FE", fill_type="solid")
 
     hdr_font  = Font(name="Arial", color="FFFFFF", bold=True, size=10)
     sec_font  = Font(name="Arial", color="FFFFFF", bold=True, size=11)
@@ -728,6 +763,29 @@ def export_excel(session_id: str):
     mfmt = "#,##0.00"
     pfmt = "0.0%"
 
+    def autofit_columns(ws, min_width: int = 8, max_width: int = 60) -> None:
+        """Set column widths based on content and enable wrap text on all cells."""
+        col_widths: dict[int, int] = {}
+        for row_cells in ws.iter_rows():
+            for cell in row_cells:
+                try:
+                    curr = cell.alignment if cell.alignment else Alignment()
+                    cell.alignment = Alignment(
+                        horizontal=curr.horizontal,
+                        vertical=curr.vertical or "center",
+                        wrap_text=True,
+                        indent=curr.indent,
+                    )
+                    if cell.value is not None:
+                        col = cell.column
+                        lines = str(cell.value).split("\n")
+                        length = max(len(line) for line in lines) + 2
+                        col_widths[col] = max(col_widths.get(col, min_width), length)
+                except Exception:
+                    pass
+        for col, width in col_widths.items():
+            ws.column_dimensions[get_column_letter(col)].width = min(max(width, min_width), max_width)
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Summary"
@@ -736,7 +794,7 @@ def export_excel(session_id: str):
     def sec_hdr(ws, r, text, ncols):
         c = ws.cell(row=r, column=1, value=text)
         c.font = sec_font; c.fill = sec_fill
-        c.alignment = Alignment(horizontal="left", vertical="center")
+        c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         ws.row_dimensions[r].height = 22
         if ncols > 1:
             ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=ncols)
@@ -758,24 +816,28 @@ def export_excel(session_id: str):
     cat_inc_tot = {c: 0.0 for c in income_cats}
     mon_inc_tot = {}
     for mo in income_months:
-        mtxs = [t for t in income_txs if t.get("month")==mo and t.get("include",True)]
+        mtxs = [t for t in income_txs if t.get("month") == mo and t.get("include", True)]
         rd = [mo]; rt = 0.0
         for cat in income_cats:
-            v = sum(abs(t.get("amount",0)) for t in mtxs if t.get("category")==cat)
+            v = sum(abs(t.get("amount", 0)) for t in mtxs if t.get("category") == cat)
             cat_inc_tot[cat] += v; rd.append(v or None); rt += v
         rd.append(rt); mon_inc_tot[mo] = rt
         for ci, val in enumerate(rd, 1):
             c = ws.cell(row=row, column=ci, value=val); c.font = norm_font; c.border = thin
-            if ci == 1: c.alignment = Alignment(horizontal="left", vertical="center")
-            else: c.number_format = mfmt; c.alignment = Alignment(horizontal="right", vertical="center")
+            if ci == 1:
+                c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+            else:
+                c.number_format = mfmt; c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
         row += 1
     grand_inc = sum(mon_inc_tot.values()); n_inc = len(income_months) or 1
-    for lbl, vals in [("Grand Total",[cat_inc_tot[c] for c in income_cats]+[grand_inc]),
-                      ("Monthly Average",[cat_inc_tot[c]/n_inc for c in income_cats]+[grand_inc/n_inc])]:
-        for ci, val in enumerate([lbl]+vals, 1):
+    for lbl, vals in [("Grand Total", [cat_inc_tot[c] for c in income_cats] + [grand_inc]),
+                      ("Monthly Average", [cat_inc_tot[c] / n_inc for c in income_cats] + [grand_inc / n_inc])]:
+        for ci, val in enumerate([lbl] + vals, 1):
             c = ws.cell(row=row, column=ci, value=val); c.font = bold_font; c.fill = tot_fill; c.border = thin
-            if ci == 1: c.alignment = Alignment(horizontal="left", vertical="center")
-            else: c.number_format = mfmt; c.alignment = Alignment(horizontal="right", vertical="center")
+            if ci == 1:
+                c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+            else:
+                c.number_format = mfmt; c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
         row += 1
     row += 1
 
@@ -787,33 +849,37 @@ def export_excel(session_id: str):
     cat_exp_tot = {c: 0.0 for c in expense_cats}
     mon_exp_tot = {}
     for mo in expense_months:
-        mtxs = [t for t in expense_txs if t.get("month")==mo and t.get("include",True)]
+        mtxs = [t for t in expense_txs if t.get("month") == mo and t.get("include", True)]
         rd = [mo]; rt = 0.0
         for cat in expense_cats:
-            v = sum(abs(t.get("amount",0)) for t in mtxs if t.get("category")==cat)
+            v = sum(abs(t.get("amount", 0)) for t in mtxs if t.get("category") == cat)
             cat_exp_tot[cat] += v; rd.append(v or None); rt += v
         rd.append(rt); mon_exp_tot[mo] = rt
         for ci, val in enumerate(rd, 1):
             c = ws.cell(row=row, column=ci, value=val); c.font = norm_font; c.border = thin
-            if ci == 1: c.alignment = Alignment(horizontal="left", vertical="center")
-            else: c.number_format = mfmt; c.alignment = Alignment(horizontal="right", vertical="center")
+            if ci == 1:
+                c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+            else:
+                c.number_format = mfmt; c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
         row += 1
     grand_exp = sum(mon_exp_tot.values()); n_exp = len(expense_months) or 1
-    for lbl, vals in [("Grand Total",[cat_exp_tot[c] for c in expense_cats]+[grand_exp]),
-                      ("Monthly Average",[cat_exp_tot[c]/n_exp for c in expense_cats]+[grand_exp/n_exp])]:
-        for ci, val in enumerate([lbl]+vals, 1):
+    for lbl, vals in [("Grand Total", [cat_exp_tot[c] for c in expense_cats] + [grand_exp]),
+                      ("Monthly Average", [cat_exp_tot[c] / n_exp for c in expense_cats] + [grand_exp / n_exp])]:
+        for ci, val in enumerate([lbl] + vals, 1):
             c = ws.cell(row=row, column=ci, value=val); c.font = bold_font; c.fill = tot_fill; c.border = thin
-            if ci == 1: c.alignment = Alignment(horizontal="left", vertical="center")
-            else: c.number_format = mfmt; c.alignment = Alignment(horizontal="right", vertical="center")
+            if ci == 1:
+                c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+            else:
+                c.number_format = mfmt; c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
         row += 1
     row += 1
 
     # Section 3 — Annual Category Totals
     row = sec_hdr(ws, row, "SECTION 3 — ANNUAL CATEGORY TOTALS", max(mx, 9))
-    for ci, h in enumerate(["Category","Annual Total","% of Total Income","Include Status"], 1):
+    for ci, h in enumerate(["Category", "Annual Total", "% of Total Income", "Include Status"], 1):
         c = ws.cell(row=row, column=ci, value=h); c.font = hdr_font; c.fill = sub_fill
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True); c.border = thin
-    for ci, h in enumerate(["Category","Annual Total","% of Total Expenses","Include Status"], 6):
+    for ci, h in enumerate(["Category", "Annual Total", "% of Total Expenses", "Include Status"], 6):
         c = ws.cell(row=row, column=ci, value=h); c.font = hdr_font; c.fill = sub_fill
         c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True); c.border = thin
     row += 1
@@ -824,79 +890,102 @@ def export_excel(session_id: str):
     for r in range(max(len(income_cats), len(expense_cats), 1)):
         if r < len(income_cats):
             cat = income_cats[r]; tot = cat_inc_tot[cat]
-            pct = tot/grand_inc if grand_inc else 0.0
+            pct = tot / grand_inc if grand_inc else 0.0
             st = "Y" if has_included(income_txs, cat) else "N"
             for ci, val in enumerate([cat, tot, pct, st], 1):
-                c = ws.cell(row=row+r, column=ci, value=val); c.border = thin
-                if ci==1: c.font=norm_font
-                elif ci==2: c.font=norm_font; c.number_format=mfmt; c.alignment=Alignment(horizontal="right")
-                elif ci==3: c.font=norm_font; c.number_format=pfmt; c.alignment=Alignment(horizontal="right")
-                else: c.font=wb_font; c.fill=inc_y_fill if st=="Y" else inc_n_fill; c.alignment=Alignment(horizontal="center")
+                c = ws.cell(row=row + r, column=ci, value=val); c.border = thin
+                if ci == 1:
+                    c.font = norm_font; c.alignment = Alignment(wrap_text=True)
+                elif ci == 2:
+                    c.font = norm_font; c.number_format = mfmt
+                    c.alignment = Alignment(horizontal="right", wrap_text=True)
+                elif ci == 3:
+                    c.font = norm_font; c.number_format = pfmt
+                    c.alignment = Alignment(horizontal="right", wrap_text=True)
+                else:
+                    c.font = wb_font; c.fill = inc_y_fill if st == "Y" else inc_n_fill
+                    c.alignment = Alignment(horizontal="center", wrap_text=True)
         if r < len(expense_cats):
             cat = expense_cats[r]; tot = cat_exp_tot[cat]
-            pct = tot/grand_exp if grand_exp else 0.0
+            pct = tot / grand_exp if grand_exp else 0.0
             st = "Y" if has_included(expense_txs, cat) else "N"
             for ci, val in enumerate([cat, tot, pct, st], 6):
-                c = ws.cell(row=row+r, column=ci, value=val); c.border = thin
-                if ci==6: c.font=norm_font
-                elif ci==7: c.font=norm_font; c.number_format=mfmt; c.alignment=Alignment(horizontal="right")
-                elif ci==8: c.font=norm_font; c.number_format=pfmt; c.alignment=Alignment(horizontal="right")
-                else: c.font=wb_font; c.fill=inc_y_fill if st=="Y" else inc_n_fill; c.alignment=Alignment(horizontal="center")
+                c = ws.cell(row=row + r, column=ci, value=val); c.border = thin
+                if ci == 6:
+                    c.font = norm_font; c.alignment = Alignment(wrap_text=True)
+                elif ci == 7:
+                    c.font = norm_font; c.number_format = mfmt
+                    c.alignment = Alignment(horizontal="right", wrap_text=True)
+                elif ci == 8:
+                    c.font = norm_font; c.number_format = pfmt
+                    c.alignment = Alignment(horizontal="right", wrap_text=True)
+                else:
+                    c.font = wb_font; c.fill = inc_y_fill if st == "Y" else inc_n_fill
+                    c.alignment = Alignment(horizontal="center", wrap_text=True)
     row += max(len(income_cats), len(expense_cats), 1) + 1
 
     # Section 4 — Key Metrics
     row = sec_hdr(ws, row, "SECTION 4 — KEY METRICS", 4)
     n_all = len(all_months) or 1
     net = grand_inc - grand_exp
-    for lbl, val in [("Total Annual Income",grand_inc),("Total Annual Expenses",grand_exp),("Net Annual Income",net),
-                     ("Monthly Average Income",grand_inc/n_all),("Monthly Average Expenses",grand_exp/n_all),
-                     ("Monthly Average Net Income",net/n_all)]:
-        lc = ws.cell(row=row, column=1, value=lbl); vc = ws.cell(row=row, column=2, value=val)
-        lc.font=bold_font; lc.fill=met_fill; lc.border=thin; lc.alignment=Alignment(horizontal="left",vertical="center")
-        vc.fill=met_fill; vc.border=thin; vc.number_format=mfmt; vc.alignment=Alignment(horizontal="right",vertical="center")
-        vc.font = Font(name="Arial",bold=True,size=10,color=("27AE60" if val>=0 else "E74C3C")) if "Net" in lbl else bold_font
+    for lbl, val in [("Total Annual Income", grand_inc), ("Total Annual Expenses", grand_exp),
+                     ("Net Annual Income", net), ("Monthly Average Income", grand_inc / n_all),
+                     ("Monthly Average Expenses", grand_exp / n_all),
+                     ("Monthly Average Net Income", net / n_all)]:
+        lc = ws.cell(row=row, column=1, value=lbl)
+        vc = ws.cell(row=row, column=2, value=val)
+        lc.font = bold_font; lc.fill = met_fill; lc.border = thin
+        lc.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        vc.fill = met_fill; vc.border = thin; vc.number_format = mfmt
+        vc.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
+        vc.font = Font(name="Arial", bold=True, size=10, color=("27AE60" if val >= 0 else "E74C3C")) \
+            if "Net" in lbl else bold_font
         row += 1
 
-    ws.column_dimensions["A"].width = 24
-    for i in range(2, max(mx, 10)+1):
-        ws.column_dimensions[get_column_letter(i)].width = 16
+    autofit_columns(ws)
 
-    # Breakdown sheet helper
+    # Breakdown sheet builder
     def build_sheet(ws_b, txs):
         banner = ("GREEN rows (Y) are counted in summary totals.  "
                   "ORANGE rows (N) are excluded but visible for reference.  "
                   "Change Include in the Review screen before re-exporting.")
         bc = ws_b.cell(row=1, column=1, value=banner)
         bc.font = Font(name="Arial", bold=True, size=10, color="FFFFFF")
-        bc.fill = hdr_fill; bc.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-        ws_b.merge_cells("A1:G1"); ws_b.row_dimensions[1].height = 36
+        bc.fill = hdr_fill
+        bc.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        ws_b.merge_cells("A1:G1")
+        ws_b.row_dimensions[1].height = 36
 
-        hdrs = ["Date","Description","Amount","Month","Category","Include","Notes / Reason"]
-        widths = [14, 45, 14, 10, 26, 10, 50]
-        for ci, (h, w) in enumerate(zip(hdrs, widths), 1):
+        hdrs = ["Date", "Description", "Amount", "Month", "Category", "Include", "Notes / Reason"]
+        for ci, h in enumerate(hdrs, 1):
             c = ws_b.cell(row=2, column=ci, value=h)
             c.font = hdr_font; c.fill = hdr_fill
-            c.alignment = Alignment(horizontal="center", vertical="center"); c.border = thin
-            ws_b.column_dimensions[get_column_letter(ci)].width = w
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            c.border = thin
         ws_b.row_dimensions[2].height = 18
 
-        for ri, tx in enumerate(sorted(txs, key=lambda t: t.get("date","")), 3):
+        for ri, tx in enumerate(sorted(txs, key=lambda t: t.get("date", "")), 3):
             inc = tx.get("include", True)
             rf = green_row if inc else orange_row
-            vals = [tx.get("date",""), tx.get("description",""), abs(tx.get("amount",0)),
-                    tx.get("month",""), tx.get("category",""), "Y" if inc else "N", tx.get("reason","")]
+            vals = [tx.get("date", ""), tx.get("description", ""), abs(tx.get("amount", 0)),
+                    tx.get("month", ""), tx.get("category", ""), "Y" if inc else "N", tx.get("reason", "")]
             for ci, val in enumerate(vals, 1):
                 c = ws_b.cell(row=ri, column=ci, value=val); c.fill = rf; c.border = thin
                 if ci == 3:
-                    c.font = norm_font; c.number_format = mfmt; c.alignment = Alignment(horizontal="right",vertical="center")
+                    c.font = norm_font; c.number_format = mfmt
+                    c.alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
                 elif ci == 6:
                     c.font = wb_font; c.fill = inc_y_fill if inc else inc_n_fill
-                    c.alignment = Alignment(horizontal="center",vertical="center")
+                    c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
                 elif ci == 7:
-                    c.font = norm_font; c.alignment = Alignment(vertical="center",wrap_text=True)
+                    c.font = norm_font
+                    c.alignment = Alignment(vertical="center", wrap_text=True)
                 else:
-                    c.font = norm_font; c.alignment = Alignment(vertical="center")
+                    c.font = norm_font
+                    c.alignment = Alignment(vertical="center", wrap_text=True)
             ws_b.row_dimensions[ri].height = 15
+
+        autofit_columns(ws_b)
 
     ws_inc = wb.create_sheet("Income Breakdown")
     build_sheet(ws_inc, income_txs)
