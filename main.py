@@ -4,6 +4,8 @@ import re
 import base64
 import tempfile
 import uuid
+import asyncio
+import time
 from collections import Counter
 from datetime import datetime
 from typing import Optional
@@ -12,7 +14,7 @@ import anthropic
 import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -26,6 +28,8 @@ if not ANTHROPIC_API_KEY:
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 sessions: dict[str, dict] = {}
+
+ANALYZE_TIMEOUT = 480  # 8 minutes
 
 
 class UpdateTransactionRequest(BaseModel):
@@ -179,6 +183,7 @@ HTML = """<!DOCTYPE html>
     isDragging: false,
     isAnalyzing: false,
     analyzeError: null,
+    progressMessage: '',
     sessionId: null,
     transactions: [],
     filter: 'all',
@@ -274,6 +279,15 @@ HTML = """<!DOCTYPE html>
       ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
       : 'bg-blue-600 text-white hover:bg-blue-700 shadow-md hover:shadow-lg active:scale-95';
 
+    var progressBar = state.isAnalyzing && state.progressMessage
+      ? '<div class="mt-3 flex items-center gap-2 justify-center">' +
+          '<div class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>' +
+          '<p class="text-sm text-blue-600 font-medium">' + h(state.progressMessage) + '</p>' +
+        '</div>'
+      : (state.isAnalyzing
+          ? '<p class="mt-3 text-center text-sm text-gray-400">Starting analysis… please keep this tab open.</p>'
+          : '');
+
     return '<div class="min-h-screen flex flex-col items-center justify-center p-6 bg-gray-50">' +
       '<div class="w-full max-w-2xl">' +
         '<div class="mb-8 text-center">' +
@@ -299,10 +313,10 @@ HTML = """<!DOCTYPE html>
         (state.analyzeError ? '<div class="mt-4 flex items-center gap-3 bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-red-600"><span class="text-lg">&#9888;</span><p class="text-sm">' + h(state.analyzeError) + '</p></div>' : '') +
         '<button id="analyze-btn" ' + (btnDis?'disabled':'') + ' class="mt-6 w-full py-4 rounded-xl font-semibold text-base flex items-center justify-center gap-3 transition-all duration-200 ' + btnCls + '">' +
           (state.isAnalyzing
-            ? '<svg class="spin w-5 h-5" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>Analyzing with Claude AI &mdash; processing all pages...'
+            ? '<svg class="spin w-5 h-5" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>Analyzing with Claude AI…'
             : '<svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>Analyze Statements') +
         '</button>' +
-        (state.isAnalyzing ? '<p class="mt-3 text-center text-sm text-gray-400">Claude is reading every page of your statement(s) — larger files take several minutes. Please keep this tab open.</p>' : '') +
+        progressBar +
       '</div>' +
     '</div>';
   }
@@ -523,7 +537,7 @@ HTML = """<!DOCTYPE html>
     var rb = document.getElementById('reset-btn');
     if (rb) rb.addEventListener('click', function(){
       setState({page:'upload',files:[],sessionId:null,transactions:[],
-                filter:'all',search:'',analyzeError:null,downloaded:false});
+                filter:'all',search:'',analyzeError:null,downloaded:false,progressMessage:''});
     });
   }
 
@@ -541,7 +555,7 @@ HTML = """<!DOCTYPE html>
 
   async function handleAnalyze() {
     if (state.files.length===0) { setState({analyzeError:'Please add at least one PDF file.'}); return; }
-    setState({isAnalyzing:true, analyzeError:null});
+    setState({isAnalyzing:true, analyzeError:null, progressMessage:''});
     try {
       var fd = new FormData();
       state.files.forEach(function(f){ fd.append('files',f); });
@@ -550,10 +564,37 @@ HTML = """<!DOCTYPE html>
         var err = await res.json().catch(function(){return {detail:'Unknown error'};});
         throw new Error(err.detail||'Error '+res.status);
       }
-      var data = await res.json();
-      setState({isAnalyzing:false, sessionId:data.session_id, transactions:data.transactions, page:'review', filter:'all', search:''});
+
+      var reader = res.body.getReader();
+      var decoder = new TextDecoder();
+      var buffer = '';
+
+      while (true) {
+        var chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, {stream: true});
+        var lines = buffer.split('\\n');
+        buffer = lines.pop();
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i].trim();
+          if (!line.startsWith('data: ')) continue;
+          var event;
+          try { event = JSON.parse(line.slice(6)); } catch(e) { continue; }
+          if (event.type === 'progress') {
+            setState({progressMessage: event.message});
+          } else if (event.type === 'result') {
+            setState({isAnalyzing:false, progressMessage:'',
+                      sessionId:event.session_id, transactions:event.transactions,
+                      page:'review', filter:'all', search:''});
+            return;
+          } else if (event.type === 'error') {
+            throw new Error(event.detail || 'Analysis failed');
+          }
+        }
+      }
+      throw new Error('Stream ended without a result');
     } catch(e) {
-      setState({isAnalyzing:false, analyzeError:e.message||'Failed to analyze. Please try again.'});
+      setState({isAnalyzing:false, progressMessage:'', analyzeError:e.message||'Failed to analyze. Please try again.'});
     }
   }
 
@@ -629,85 +670,148 @@ def health():
     return {"status": "ok"}
 
 
+# ── SSE helpers ───────────────────────────────────────────────────────────────
+
+def _sse_event(event_type: str, data: dict) -> str:
+    return f"data: {json.dumps({'type': event_type, **data})}\n\n"
+
+
+def _sse_error(detail: str) -> str:
+    return f"data: {json.dumps({'type': 'error', 'detail': detail})}\n\n"
+
+
+async def _call_claude(content_blocks: list) -> list:
+    """Run a Claude API call in a thread (sync SDK) and return parsed transactions."""
+    def _sync() -> str:
+        with client.messages.stream(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=32000,
+            messages=[{"role": "user", "content": content_blocks}],
+        ) as stream:
+            return stream.get_final_text().strip()
+
+    try:
+        response_text = await asyncio.to_thread(_sync)
+        raw = extract_json_transactions(response_text)
+        result = []
+        for tx in raw:
+            tx = normalize_transaction(tx)
+            tx["id"] = str(uuid.uuid4())
+            result.append(tx)
+        return result
+    except Exception as e:
+        print(f"[WARN] API/parse error: {e}")
+        return []
+
+
+async def _analyze_stream(file_data: list[tuple[str, bytes]]):
+    """Async generator that yields SSE events while processing PDFs in batches."""
+    TEXT_CHUNK = 20   # pages per API call for text-based PDFs
+    IMAGE_CHUNK = 5   # pages per API call for scanned PDFs
+    deadline = time.monotonic() + ANALYZE_TIMEOUT
+    all_transactions: list = []
+
+    try:
+        for filename, pdf_bytes in file_data:
+            try:
+                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                total_pages = len(doc)
+            except Exception as e:
+                yield _sse_error(f"Could not open {filename}: {e}")
+                return
+
+            print(f"[INFO] {filename}: {total_pages} page(s)")
+
+            # Classify each page as text or image
+            text_pages: list[tuple[int, str]] = []
+            image_pages: list[tuple[int, str]] = []
+            for page_idx in range(total_pages):
+                try:
+                    page = doc[page_idx]
+                    page_text = page.get_text().strip()
+                    if len(page_text) > 50:
+                        text_pages.append((page_idx, page_text))
+                    else:
+                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                        img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode("utf-8")
+                        image_pages.append((page_idx, img_b64))
+                except Exception as e:
+                    print(f"[WARN] Could not read page {page_idx + 1} of {filename}: {e}")
+            doc.close()
+
+            file_label = f" ({filename})" if len(file_data) > 1 else ""
+
+            # Process text pages in batches of TEXT_CHUNK
+            for i in range(0, len(text_pages), TEXT_CHUNK):
+                if time.monotonic() > deadline:
+                    yield _sse_error("Processing timed out after 8 minutes")
+                    return
+                batch = text_pages[i:i + TEXT_CHUNK]
+                first_p, last_p = batch[0][0] + 1, batch[-1][0] + 1
+                yield _sse_event("progress", {
+                    "message": f"Processing pages {first_p}–{last_p} of {total_pages}{file_label}…"
+                })
+                combined = "\n\n".join(
+                    f"--- Page {pi + 1} of {total_pages} ---\n{txt}" for pi, txt in batch
+                )
+                content = [{"type": "text", "text": PROMPT + f"\n\n{combined}"}]
+                txs = await _call_claude(content)
+                all_transactions.extend(txs)
+                print(f"[INFO] Text batch pages {first_p}-{last_p} of {filename}: {len(txs)} transactions")
+
+            # Process image pages in batches of IMAGE_CHUNK
+            for i in range(0, len(image_pages), IMAGE_CHUNK):
+                if time.monotonic() > deadline:
+                    yield _sse_error("Processing timed out after 8 minutes")
+                    return
+                batch = image_pages[i:i + IMAGE_CHUNK]
+                first_p, last_p = batch[0][0] + 1, batch[-1][0] + 1
+                yield _sse_event("progress", {
+                    "message": f"Processing pages {first_p}–{last_p} of {total_pages} (scanned){file_label}…"
+                })
+                content: list = [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}}
+                    for _, img_b64 in batch
+                ]
+                content.append({
+                    "type": "text",
+                    "text": PROMPT + f"\n\n(Pages {first_p}–{last_p} of {total_pages} shown above as images)",
+                })
+                txs = await _call_claude(content)
+                all_transactions.extend(txs)
+                print(f"[INFO] Image batch pages {first_p}-{last_p} of {filename}: {len(txs)} transactions")
+
+        if all_transactions:
+            all_transactions = deduplicate_categories(all_transactions)
+
+        session_id = str(uuid.uuid4())
+        sessions[session_id] = {"transactions": all_transactions}
+        yield _sse_event("result", {
+            "session_id": session_id,
+            "transactions": all_transactions,
+            "count": len(all_transactions),
+        })
+
+    except Exception as e:
+        yield _sse_error(str(e))
+
+
 @app.post("/analyze")
 async def analyze_statements(files: list[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
-
-    all_transactions = []
-
     for file in files:
         if not file.filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail=f"{file.filename} is not a PDF")
 
-        pdf_bytes = await file.read()
+    # Read all file bytes before streaming so uploads don't block the generator
+    file_data = [(file.filename, await file.read()) for file in files]
 
-        try:
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            total_pages = len(doc)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Could not open {file.filename}: {e}")
-
-        print(f"[INFO] {file.filename}: {total_pages} page(s)")
-
-        for page_idx in range(total_pages):
-            print(f"[INFO] Processing page {page_idx+1}/{total_pages} — {file.filename}")
-
-            # Build content blocks for this page (text or image fallback)
-            try:
-                page = doc[page_idx]
-                page_text = page.get_text().strip()
-                if len(page_text) > 50:
-                    content_blocks = [
-                        {"type": "text", "text": PROMPT + f"\n\nPage {page_idx+1} of {total_pages}:\n\n{page_text}"}
-                    ]
-                else:
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                    img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode("utf-8")
-                    content_blocks = [
-                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
-                        {"type": "text", "text": PROMPT + f"\n\n(Page {page_idx+1} of {total_pages})"},
-                    ]
-            except Exception as e:
-                print(f"[WARN] Could not process page {page_idx+1} of {file.filename}: {e}")
-                continue
-
-            # Call Claude API
-            try:
-                with client.messages.stream(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=32000,
-                    messages=[{"role": "user", "content": content_blocks}],
-                ) as stream:
-                    response_text = stream.get_final_text().strip()
-            except Exception as e:
-                print(f"[WARN] API error on page {page_idx+1} of {file.filename}: {e}")
-                continue
-
-            # Parse transactions from response
-            try:
-                raw = extract_json_transactions(response_text)
-            except Exception as e:
-                print(f"[WARN] Parse error on page {page_idx+1}: {e}")
-                continue
-
-            added = 0
-            for tx in raw:
-                tx = normalize_transaction(tx)
-                tx["id"] = str(uuid.uuid4())
-                all_transactions.append(tx)
-                added += 1
-            print(f"[INFO] Page {page_idx+1}/{total_pages}: {added} transactions found")
-
-        doc.close()
-
-    # Post-processing: normalize inconsistent category/include across all pages and files
-    if all_transactions:
-        all_transactions = deduplicate_categories(all_transactions)
-
-    session_id = str(uuid.uuid4())
-    sessions[session_id] = {"transactions": all_transactions}
-    return {"session_id": session_id, "transactions": all_transactions, "count": len(all_transactions)}
+    return StreamingResponse(
+        _analyze_stream(file_data),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.put("/sessions/{session_id}/transactions/{transaction_id}")
