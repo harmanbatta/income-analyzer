@@ -5,7 +5,6 @@ import base64
 import tempfile
 import uuid
 import asyncio
-import time
 from collections import Counter
 from datetime import datetime
 from typing import Optional
@@ -14,7 +13,7 @@ import anthropic
 import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -28,8 +27,8 @@ if not ANTHROPIC_API_KEY:
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 sessions: dict[str, dict] = {}
-
-ANALYZE_TIMEOUT = 480  # 8 minutes
+jobs: dict[str, dict] = {}
+_running_tasks: set = set()
 
 
 class UpdateTransactionRequest(BaseModel):
@@ -183,7 +182,8 @@ HTML = """<!DOCTYPE html>
     isDragging: false,
     isAnalyzing: false,
     analyzeError: null,
-    progressMessage: '',
+    jobId: null,
+    progressInfo: {},
     sessionId: null,
     transactions: [],
     filter: 'all',
@@ -192,6 +192,8 @@ HTML = """<!DOCTYPE html>
     downloading: false,
     downloaded: false
   };
+
+  var pollTimer = null;
 
   function h(str) {
     return String(str)
@@ -239,6 +241,7 @@ HTML = """<!DOCTYPE html>
     var scrollY = window.scrollY;
     var app = document.getElementById('app');
     if (state.page === 'upload') app.innerHTML = renderUpload();
+    else if (state.page === 'progress') app.innerHTML = renderProgress();
     else if (state.page === 'review') app.innerHTML = renderReview();
     else app.innerHTML = renderDownload();
     attachListeners();
@@ -279,15 +282,6 @@ HTML = """<!DOCTYPE html>
       ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
       : 'bg-blue-600 text-white hover:bg-blue-700 shadow-md hover:shadow-lg active:scale-95';
 
-    var progressBar = state.isAnalyzing && state.progressMessage
-      ? '<div class="mt-3 flex items-center gap-2 justify-center">' +
-          '<div class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div>' +
-          '<p class="text-sm text-blue-600 font-medium">' + h(state.progressMessage) + '</p>' +
-        '</div>'
-      : (state.isAnalyzing
-          ? '<p class="mt-3 text-center text-sm text-gray-400">Starting analysis… please keep this tab open.</p>'
-          : '');
-
     return '<div class="min-h-screen flex flex-col items-center justify-center p-6 bg-gray-50">' +
       '<div class="w-full max-w-2xl">' +
         '<div class="mb-8 text-center">' +
@@ -313,10 +307,43 @@ HTML = """<!DOCTYPE html>
         (state.analyzeError ? '<div class="mt-4 flex items-center gap-3 bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-red-600"><span class="text-lg">&#9888;</span><p class="text-sm">' + h(state.analyzeError) + '</p></div>' : '') +
         '<button id="analyze-btn" ' + (btnDis?'disabled':'') + ' class="mt-6 w-full py-4 rounded-xl font-semibold text-base flex items-center justify-center gap-3 transition-all duration-200 ' + btnCls + '">' +
           (state.isAnalyzing
-            ? '<svg class="spin w-5 h-5" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>Analyzing with Claude AI…'
+            ? '<svg class="spin w-5 h-5" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>Uploading files…'
             : '<svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>Analyze Statements') +
         '</button>' +
-        progressBar +
+      '</div>' +
+    '</div>';
+  }
+
+  /* ============================================================
+     PROGRESS PAGE
+  ============================================================ */
+  function renderProgress() {
+    var info = state.progressInfo || {};
+    var isError = info.status === 'error';
+    var pct = (info.total_pages > 0) ? Math.round(info.pages_done / info.total_pages * 100) : 0;
+
+    return '<div class="min-h-screen flex flex-col items-center justify-center p-6 bg-gray-50">' +
+      '<div class="w-full max-w-xl">' +
+        '<div class="mb-8 text-center">' +
+          '<div class="inline-flex items-center justify-center w-14 h-14 rounded-xl ' + (isError ? 'bg-red-500' : 'bg-blue-600') + ' mb-4">' +
+            (isError
+              ? '<svg class="w-7 h-7 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>'
+              : '<svg class="spin w-7 h-7 text-white" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>') +
+          '</div>' +
+          '<h1 class="text-3xl font-bold text-gray-900 tracking-tight">' + (isError ? 'Analysis Failed' : 'Analyzing Statements') + '</h1>' +
+          '<p class="mt-2 text-gray-500">' + (isError ? 'An error occurred during processing.' : 'Processing your bank statements with Claude AI…') + '</p>' +
+        '</div>' +
+        '<div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-6 mb-6">' +
+          '<p class="text-sm font-semibold text-gray-700 mb-4">' + h(info.current_file || 'Starting…') + '</p>' +
+          (info.total_pages > 0
+            ? '<div class="mb-1"><div class="flex justify-between text-xs text-gray-400 mb-2"><span>Pages processed</span><span>' + info.pages_done + ' / ' + info.total_pages + '</span></div>' +
+              '<div class="w-full bg-gray-200 rounded-full h-2"><div class="bg-blue-600 h-2 rounded-full transition-all duration-500" style="width:' + pct + '%"></div></div></div>'
+            : '<div class="flex items-center gap-2 text-gray-400 text-sm"><div class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div><span>Preparing files…</span></div>') +
+          (isError ? '<p class="mt-4 text-sm text-red-600 bg-red-50 rounded-lg p-3">' + h(info.error || 'Unknown error') + '</p>' : '') +
+        '</div>' +
+        (isError
+          ? '<button id="retry-btn" class="w-full py-4 rounded-xl font-semibold text-base bg-blue-600 text-white hover:bg-blue-700 shadow-md hover:shadow-lg transition-all">← Back to Upload</button>'
+          : '<p class="text-center text-sm text-gray-400">Checking progress every 5 seconds — do not close this tab.</p>') +
       '</div>' +
     '</div>';
   }
@@ -491,6 +518,7 @@ HTML = """<!DOCTYPE html>
   ============================================================ */
   function attachListeners() {
     if (state.page === 'upload') attachUpload();
+    else if (state.page === 'progress') attachProgress();
     else if (state.page === 'review') attachReview();
     else attachDownload();
   }
@@ -516,6 +544,14 @@ HTML = """<!DOCTYPE html>
     if (ab) ab.addEventListener('click', handleAnalyze);
   }
 
+  function attachProgress() {
+    var rb = document.getElementById('retry-btn');
+    if (rb) rb.addEventListener('click', function(){
+      stopPolling();
+      setState({page:'upload', jobId:null, progressInfo:{}, analyzeError:null});
+    });
+  }
+
   function attachReview() {
     document.querySelectorAll('[data-filter]').forEach(function(btn){
       btn.addEventListener('click', function(){ setState({filter: btn.getAttribute('data-filter')}); });
@@ -536,8 +572,10 @@ HTML = """<!DOCTYPE html>
     if (bb) bb.addEventListener('click', function(){ setState({page:'review'}); });
     var rb = document.getElementById('reset-btn');
     if (rb) rb.addEventListener('click', function(){
+      stopPolling();
       setState({page:'upload',files:[],sessionId:null,transactions:[],
-                filter:'all',search:'',analyzeError:null,downloaded:false,progressMessage:''});
+                filter:'all',search:'',analyzeError:null,downloaded:false,
+                jobId:null,progressInfo:{}});
     });
   }
 
@@ -555,7 +593,7 @@ HTML = """<!DOCTYPE html>
 
   async function handleAnalyze() {
     if (state.files.length===0) { setState({analyzeError:'Please add at least one PDF file.'}); return; }
-    setState({isAnalyzing:true, analyzeError:null, progressMessage:''});
+    setState({isAnalyzing:true, analyzeError:null});
     try {
       var fd = new FormData();
       state.files.forEach(function(f){ fd.append('files',f); });
@@ -564,37 +602,59 @@ HTML = """<!DOCTYPE html>
         var err = await res.json().catch(function(){return {detail:'Unknown error'};});
         throw new Error(err.detail||'Error '+res.status);
       }
-
-      var reader = res.body.getReader();
-      var decoder = new TextDecoder();
-      var buffer = '';
-
-      while (true) {
-        var chunk = await reader.read();
-        if (chunk.done) break;
-        buffer += decoder.decode(chunk.value, {stream: true});
-        var lines = buffer.split('\\n');
-        buffer = lines.pop();
-        for (var i = 0; i < lines.length; i++) {
-          var line = lines[i].trim();
-          if (!line.startsWith('data: ')) continue;
-          var event;
-          try { event = JSON.parse(line.slice(6)); } catch(e) { continue; }
-          if (event.type === 'progress') {
-            setState({progressMessage: event.message});
-          } else if (event.type === 'result') {
-            setState({isAnalyzing:false, progressMessage:'',
-                      sessionId:event.session_id, transactions:event.transactions,
-                      page:'review', filter:'all', search:''});
-            return;
-          } else if (event.type === 'error') {
-            throw new Error(event.detail || 'Analysis failed');
-          }
-        }
-      }
-      throw new Error('Stream ended without a result');
+      var data = await res.json();
+      setState({
+        isAnalyzing: false,
+        jobId: data.job_id,
+        page: 'progress',
+        progressInfo: {status:'processing', current_file:'Starting…', pages_done:0, total_pages:0}
+      });
+      startPolling(data.job_id);
     } catch(e) {
-      setState({isAnalyzing:false, progressMessage:'', analyzeError:e.message||'Failed to analyze. Please try again.'});
+      setState({isAnalyzing:false, analyzeError:e.message||'Failed to analyze. Please try again.'});
+    }
+  }
+
+  function startPolling(jobId) {
+    stopPolling();
+    setTimeout(function(){ pollJob(jobId); }, 2000);
+    pollTimer = setInterval(function(){ pollJob(jobId); }, 5000);
+  }
+
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  async function pollJob(jobId) {
+    if (state.page !== 'progress') { stopPolling(); return; }
+    try {
+      var res = await fetch('/jobs/'+jobId+'/status');
+      if (!res.ok) return;
+      var data = await res.json();
+      if (data.status === 'complete') {
+        stopPolling();
+        var txRes = await fetch('/sessions/'+data.session_id+'/transactions');
+        if (!txRes.ok) {
+          setState({progressInfo:{status:'error', error:'Failed to load transactions. Please try again.', current_file:'', pages_done:0, total_pages:0}});
+          return;
+        }
+        var transactions = await txRes.json();
+        setState({
+          page: 'review',
+          sessionId: data.session_id,
+          transactions: transactions,
+          progressInfo: data,
+          filter: 'all',
+          search: ''
+        });
+      } else if (data.status === 'error') {
+        stopPolling();
+        setState({progressInfo: data});
+      } else {
+        setState({progressInfo: data});
+      }
+    } catch(e) {
+      // silent — will retry on next interval
     }
   }
 
@@ -670,16 +730,6 @@ def health():
     return {"status": "ok"}
 
 
-# ── SSE helpers ───────────────────────────────────────────────────────────────
-
-def _sse_event(event_type: str, data: dict) -> str:
-    return f"data: {json.dumps({'type': event_type, **data})}\n\n"
-
-
-def _sse_error(detail: str) -> str:
-    return f"data: {json.dumps({'type': 'error', 'detail': detail})}\n\n"
-
-
 async def _call_claude(content_blocks: list) -> list:
     """Run a Claude API call in a thread (sync SDK) and return parsed transactions."""
     def _sync() -> str:
@@ -704,25 +754,36 @@ async def _call_claude(content_blocks: list) -> list:
         return []
 
 
-async def _analyze_stream(file_data: list[tuple[str, bytes]]):
-    """Async generator that yields SSE events while processing PDFs in batches."""
-    TEXT_CHUNK = 20   # pages per API call for text-based PDFs
-    IMAGE_CHUNK = 5   # pages per API call for scanned PDFs
-    deadline = time.monotonic() + ANALYZE_TIMEOUT
+async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
+    """Background task: process PDFs one at a time and store results in jobs dict."""
+    TEXT_CHUNK = 20
+    IMAGE_CHUNK = 5
     all_transactions: list = []
+    total_files = len(file_data)
 
     try:
-        for filename, pdf_bytes in file_data:
+        for file_idx, (filename, pdf_bytes) in enumerate(file_data):
+            jobs[job_id].update({
+                "current_file": f"Processing file {file_idx + 1} of {total_files}: {filename}",
+                "pages_done": 0,
+                "total_pages": 0,
+            })
+
             try:
                 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
                 total_pages = len(doc)
             except Exception as e:
-                yield _sse_error(f"Could not open {filename}: {e}")
+                jobs[job_id] = {
+                    "status": "error",
+                    "error": f"Could not open {filename}: {e}",
+                    "current_file": f"Failed on file {file_idx + 1} of {total_files}: {filename}",
+                    "pages_done": 0,
+                    "total_pages": 0,
+                }
                 return
 
             print(f"[INFO] {filename}: {total_pages} page(s)")
 
-            # Classify each page as text or image
             text_pages: list[tuple[int, str]] = []
             image_pages: list[tuple[int, str]] = []
             for page_idx in range(total_pages):
@@ -739,36 +800,34 @@ async def _analyze_stream(file_data: list[tuple[str, bytes]]):
                     print(f"[WARN] Could not read page {page_idx + 1} of {filename}: {e}")
             doc.close()
 
-            file_label = f" ({filename})" if len(file_data) > 1 else ""
+            readable_pages = len(text_pages) + len(image_pages)
+            jobs[job_id]["total_pages"] = readable_pages
+            pages_done = 0
 
-            # Process text pages in batches of TEXT_CHUNK
             for i in range(0, len(text_pages), TEXT_CHUNK):
-                if time.monotonic() > deadline:
-                    yield _sse_error("Processing timed out after 8 minutes")
-                    return
                 batch = text_pages[i:i + TEXT_CHUNK]
                 first_p, last_p = batch[0][0] + 1, batch[-1][0] + 1
-                yield _sse_event("progress", {
-                    "message": f"Processing pages {first_p}–{last_p} of {total_pages}{file_label}…"
-                })
+                jobs[job_id]["current_file"] = (
+                    f"Processing file {file_idx + 1} of {total_files}: {filename} "
+                    f"(pages {first_p}–{last_p} of {total_pages})"
+                )
                 combined = "\n\n".join(
                     f"--- Page {pi + 1} of {total_pages} ---\n{txt}" for pi, txt in batch
                 )
                 content = [{"type": "text", "text": PROMPT + f"\n\n{combined}"}]
                 txs = await _call_claude(content)
                 all_transactions.extend(txs)
+                pages_done += len(batch)
+                jobs[job_id]["pages_done"] = pages_done
                 print(f"[INFO] Text batch pages {first_p}-{last_p} of {filename}: {len(txs)} transactions")
 
-            # Process image pages in batches of IMAGE_CHUNK
             for i in range(0, len(image_pages), IMAGE_CHUNK):
-                if time.monotonic() > deadline:
-                    yield _sse_error("Processing timed out after 8 minutes")
-                    return
                 batch = image_pages[i:i + IMAGE_CHUNK]
                 first_p, last_p = batch[0][0] + 1, batch[-1][0] + 1
-                yield _sse_event("progress", {
-                    "message": f"Processing pages {first_p}–{last_p} of {total_pages} (scanned){file_label}…"
-                })
+                jobs[job_id]["current_file"] = (
+                    f"Processing file {file_idx + 1} of {total_files}: {filename} "
+                    f"(scanned pages {first_p}–{last_p} of {total_pages})"
+                )
                 content: list = [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}}
                     for _, img_b64 in batch
@@ -779,6 +838,8 @@ async def _analyze_stream(file_data: list[tuple[str, bytes]]):
                 })
                 txs = await _call_claude(content)
                 all_transactions.extend(txs)
+                pages_done += len(batch)
+                jobs[job_id]["pages_done"] = pages_done
                 print(f"[INFO] Image batch pages {first_p}-{last_p} of {filename}: {len(txs)} transactions")
 
         if all_transactions:
@@ -786,14 +847,23 @@ async def _analyze_stream(file_data: list[tuple[str, bytes]]):
 
         session_id = str(uuid.uuid4())
         sessions[session_id] = {"transactions": all_transactions}
-        yield _sse_event("result", {
+        jobs[job_id].update({
+            "status": "complete",
             "session_id": session_id,
-            "transactions": all_transactions,
-            "count": len(all_transactions),
+            "transaction_count": len(all_transactions),
+            "current_file": f"Complete — {len(all_transactions)} transactions extracted from {total_files} file(s)",
         })
+        print(f"[INFO] Job {job_id} complete: {len(all_transactions)} transactions, session {session_id}")
 
     except Exception as e:
-        yield _sse_error(str(e))
+        jobs[job_id] = {
+            "status": "error",
+            "error": str(e),
+            "current_file": "",
+            "pages_done": 0,
+            "total_pages": 0,
+        }
+        print(f"[ERROR] Job {job_id} failed: {e}")
 
 
 @app.post("/analyze")
@@ -804,14 +874,46 @@ async def analyze_statements(files: list[UploadFile] = File(...)):
         if not file.filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail=f"{file.filename} is not a PDF")
 
-    # Read all file bytes before streaming so uploads don't block the generator
     file_data = [(file.filename, await file.read()) for file in files]
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "status": "processing",
+        "current_file": f"Starting — 0 of {len(file_data)} files processed",
+        "pages_done": 0,
+        "total_pages": 0,
+    }
 
-    return StreamingResponse(
-        _analyze_stream(file_data),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    task = asyncio.create_task(_process_job(job_id, file_data))
+    _running_tasks.add(task)
+    task.add_done_callback(_running_tasks.discard)
+
+    return {"job_id": job_id}
+
+
+@app.get("/jobs/{job_id}/status")
+def get_job_status(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = jobs[job_id]
+    response = {
+        "status": job["status"],
+        "current_file": job.get("current_file", ""),
+        "pages_done": job.get("pages_done", 0),
+        "total_pages": job.get("total_pages", 0),
+    }
+    if job["status"] == "complete":
+        response["session_id"] = job["session_id"]
+        response["transaction_count"] = job["transaction_count"]
+    elif job["status"] == "error":
+        response["error"] = job.get("error", "Unknown error")
+    return response
+
+
+@app.get("/sessions/{session_id}/transactions")
+def get_session_transactions(session_id: str):
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return sessions[session_id]["transactions"]
 
 
 @app.put("/sessions/{session_id}/transactions/{transaction_id}")
