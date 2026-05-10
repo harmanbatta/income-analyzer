@@ -1,4 +1,4 @@
-import os
+﻿import os
 import json
 import re
 import base64
@@ -9,7 +9,8 @@ from collections import Counter
 from datetime import datetime
 from typing import Optional
 
-import anthropic
+import time
+import google.generativeai as genai
 import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,11 +22,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.formatting.rule import CellIsRule
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-if not ANTHROPIC_API_KEY:
-    raise RuntimeError("ANTHROPIC_API_KEY environment variable is required")
-
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
 sessions: dict[str, dict] = {}
 jobs: dict[str, dict] = {}
 _running_tasks: set = set()
@@ -146,12 +143,12 @@ PROMPT = """MORTGAGE UNDERWRITING — BANK STATEMENT INCOME & EXPENSE ANALYSIS
 You are a mortgage underwriting analyst. Analyze the uploaded bank statement and return a structured JSON object with every transaction. Do not produce the Excel directly. Return clean structured data for human review first.
 EXTRACTION: Extract every single transaction without exception — do not skip, group, summarize, or combine any lines. For each transaction return: date (YYYY-MM-DD), description (exact text from statement), amount (positive number), type (income or expense), month (e.g. Apr-25), category, suggested_include (Y or N), reason (plain English explanation). Do not include opening balance, closing balance, or running balance lines as transactions. Only extract actual debit and credit transactions.
 LARGE STATEMENTS: If the statement has hundreds of transactions, you must still extract every single one. Do not stop early. Do not summarize groups of transactions. Every line item must appear as its own row.
-CATEGORIES: Do not use a fixed list. Read the statement and assign the most specific label from the payee name or transfer type exactly as it appears. Income examples: E-Transfer In, ATM Deposit, Mobile Deposit, Cheque Deposit, Wire Transfer, Cash Deposit, Lendcare Loan, Internal Transfer In, NSF Reversal, Govt Rebate, or exact sender name. Expense examples: exact payee name such as Enbridge Gas or Cogeco, or type such as E-Transfer Out, Cash Withdrawal, Bank Charges, Cheque, CC Transfer, Transfer Out. Use Other Income or Other Expense only if truly unclear and explain in reason field. SPECIAL CATEGORY RULE: MSP fees, merchant services fees, point of sale fees, and terminal fees — always categorize these as Merchant Services Fee and always set suggested_include to Y. Never categorize these as Bank Charges.
-CONSISTENCY RULE: If the same payee or description appears multiple times, it must always get the same category and the same suggested_include value every single time. Never categorize the same type of transaction differently on different dates.
+CATEGORIES: Do not use a fixed list. Read the statement and assign the most specific label from the payee name or transfer type exactly as it appears. Income examples: E-Transfer In, ATM Deposit, Mobile Deposit, Cheque Deposit, Wire Transfer, Cash Deposit, Lendcare Loan, Internal Transfer In, NSF Reversal, Govt Rebate, or exact sender name. Expense examples: exact payee name such as Enbridge Gas or Cogeco, or type such as E-Transfer Out, Cash Withdrawal, Bank Charges, Cheque, CC Transfer, Transfer Out. Use Other Income or Other Expense only if truly unclear and explain in reason field. SPECIAL CATEGORY RULE: MSP fees, merchant services fees, point of sale fees, and terminal fees — always categorize these as Merchant Services Fee and always set suggested_include to Y. Never categorize these as Bank Charges. Any description starting with D/L or containing INT followed by a number string is a direct debit or interest payment — categorize as the exact payee name if identifiable or as Direct Debit Payment if unclear, and set suggested_include Y.
+CONSISTENCY RULE: This rule is absolute and non-negotiable. Identical or near-identical transaction descriptions must always receive identical category and identical suggested_include values across the entire statement and across all pages. If the same payee or description pattern appears 50 times, all 50 must have identical category and suggested_include. Never make a different judgment on the same type of transaction on different dates. Before finalizing output, mentally scan all transactions and ensure no duplicates have conflicting categories or include values.
 INCLUDE / EXCLUDE LOGIC: Every transaction must appear in the output regardless of Y or N. Y or N only controls whether it counts in summary totals. The reviewer can flip any Y or N in the review screen.
-INCOME — Auto-set N, flag as excluded: Internal transfers from own accounts — any transfer that appears to come from the same account holder at the same or another bank, look for keywords like TFR-FR, transfer from, own account. NSF reversals and re-credits after returned payments. Government rebates such as HST rebate, GST credit, Ontario Trillium Benefit. Any wire transfer regardless of amount — set N and reason: Review: wire transfer — verify source and whether this is qualifying income. Any deposit that is a reversal or return of a prior outgoing transaction — including e-transfers that were sent out and came back, if an e-transfer was sent out and then deposited back it is NOT income, set N and reason: Returned outgoing e-transfer — not new income. Any deposit with no clear identifiable source — reason must say: Review: unusual deposit — source unclear. Lendcare loan deposits — always set N with reason: Lendcare loan — verify if this should be counted as qualifying income. Any single deposit that is significantly larger than the average deposit amount in the statement — set N and reason: Review: unusually large deposit — verify source. Any deposit that appears to be a loan, line of credit draw, financing, or borrowing from any lender or financial institution — set N with reason: Review: possible loan deposit — verify if this is qualifying income. Look for keywords like loan, LOC, credit, financing, advance, lendcare, or any known lender name in the description.
+INCOME — Auto-set N, flag as excluded: Internal transfers from own accounts — any transfer that appears to come from the same account holder at the same or another bank, look for keywords like TFR-FR, transfer from, own account. NSF reversals and re-credits after returned payments. Government rebates such as HST rebate, GST credit, Ontario Trillium Benefit. Any wire transfer regardless of amount — set N and reason: Review: wire transfer — verify source and whether this is qualifying income. Any deposit that is a reversal or return of a prior outgoing transaction — including e-transfers that were sent out and came back, if an e-transfer was sent out and then deposited back it is NOT income, set N and reason: Returned outgoing e-transfer — not new income. Any deposit with no clear identifiable source — reason must say: Review: unusual deposit — source unclear. Lendcare loan deposits — always set N with reason: Lendcare loan — verify if this should be counted as qualifying income. Any single deposit that is significantly larger than the average deposit amount in the statement — set N and reason: Review: unusually large deposit — verify source. Any deposit that appears to be a loan, line of credit draw, financing, or borrowing from any lender or financial institution — set N with reason: Review: possible loan deposit — verify if this is qualifying income. Look for keywords like loan, LOC, credit, financing, advance, lendcare, or any known lender name in the description. Any transaction description that appears to be an outgoing or debit transaction must never be classified as income regardless of how it appears. If a transaction is clearly money leaving the account it is always an expense. Double check every income transaction — if there is any doubt whether it is truly incoming money, set it as expense.
 INCOME — Auto-set Y: E-transfers from clearly external senders. ATM deposits, mobile deposits, cash deposits, cheque deposits from third parties. Regular recurring deposits that appear employment or business related. When uncertain default Y and note uncertainty in reason.
-EXPENSE — Auto-set N, always excluded: ALL bank fees without exception — monthly plan fees, NSF fees, overdraft interest, e-transfer send fees, wire fees, service charges — always N, never override. Credit card payments and CC transfers. Transfers to own accounts at same or other institutions.
+EXPENSE — Auto-set N, always excluded: ALL bank fees without exception — monthly plan fees, NSF fees, overdraft interest, e-transfer send fees, wire fees, service charges — always N, never override. Credit card payments and CC transfers. Transfers to own accounts at same or other institutions. Credit card bill payments of any kind — look for keywords like MC, VISA, AMEX, MASTERCARD, CAN TIRE MC, TD VISA, CIBC VISA, RBC VISA, SCOTIA VISA, BMO MC, or any description that combines a card issuer name with alphanumeric characters. Always N never override.
 EXPENSE — Auto-set Y: Insurance payments. Utilities such as gas, hydro, internet, cable. Loan and mortgage payments. E-transfers out to clearly external payees. Cheques payable to third party individuals or businesses — always Y unless there is a clear reason not to include. Rent payments. Any regular identifiable recurring expense. When uncertain default Y and note uncertainty in reason.
 FLAGGING UNUSUAL ITEMS: For any transaction that seems unusual, one-time, very large, or unclear, always set reason to start with Review: followed by your concern. This applies to both income and expenses.
 OUTPUT FORMAT: Return only valid JSON with no prose and no markdown fences. Structure: statement_period, account_holder, bank, transactions array where each transaction has date, description, amount, type, month, category, suggested_include, reason."""
@@ -730,34 +727,56 @@ def health():
     return {"status": "ok"}
 
 
-async def _call_claude(content_blocks: list) -> list:
-    """Run a Claude API call in a thread (sync SDK) and return parsed transactions."""
-    def _sync() -> str:
-        with client.messages.stream(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=32000,
-            messages=[{"role": "user", "content": content_blocks}],
-        ) as stream:
-            return stream.get_final_text().strip()
+async def _call_gemini(pdf_bytes: bytes, filename: str) -> list:
+    """Upload entire PDF to Gemini 1.5 Pro, extract transactions, then delete the upload."""
+    def _sync() -> list:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+
+        gemini_file = None
+        try:
+            gemini_file = genai.upload_file(tmp_path, mime_type="application/pdf")
+            while gemini_file.state.name == "PROCESSING":
+                time.sleep(2)
+                gemini_file = genai.get_file(gemini_file.name)
+            if gemini_file.state.name != "ACTIVE":
+                raise RuntimeError(f"Gemini file not active: {gemini_file.state.name}")
+
+            model = genai.GenerativeModel("gemini-1.5-pro")
+            response = model.generate_content([gemini_file, PROMPT])
+            response_text = response.text.strip()
+
+            raw = extract_json_transactions(response_text)
+            result = []
+            for tx in raw:
+                tx = normalize_transaction(tx)
+                tx["id"] = str(uuid.uuid4())
+                result.append(tx)
+            return result
+        except Exception as e:
+            print(f"[WARN] Gemini API/parse error for {filename}: {e}")
+            return []
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            if gemini_file is not None:
+                try:
+                    gemini_file.delete()
+                except Exception as e:
+                    print(f"[WARN] Could not delete Gemini file for {filename}: {e}")
 
     try:
-        response_text = await asyncio.to_thread(_sync)
-        raw = extract_json_transactions(response_text)
-        result = []
-        for tx in raw:
-            tx = normalize_transaction(tx)
-            tx["id"] = str(uuid.uuid4())
-            result.append(tx)
-        return result
+        return await asyncio.to_thread(_sync)
     except Exception as e:
-        print(f"[WARN] API/parse error: {e}")
+        print(f"[WARN] Gemini thread error for {filename}: {e}")
         return []
 
 
 async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
     """Background task: process PDFs one at a time and store results in jobs dict."""
-    TEXT_CHUNK = 20
-    IMAGE_CHUNK = 5
     all_transactions: list = []
     total_files = len(file_data)
 
@@ -772,6 +791,7 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
             try:
                 doc = fitz.open(stream=pdf_bytes, filetype="pdf")
                 total_pages = len(doc)
+                doc.close()
             except Exception as e:
                 jobs[job_id] = {
                     "status": "error",
@@ -783,64 +803,33 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
                 return
 
             print(f"[INFO] {filename}: {total_pages} page(s)")
+            jobs[job_id]["total_pages"] = total_pages
+            jobs[job_id]["current_file"] = (
+                f"Processing file {file_idx + 1} of {total_files}: {filename} "
+                f"(uploading {total_pages} pages to Gemini…)"
+            )
 
-            text_pages: list[tuple[int, str]] = []
-            image_pages: list[tuple[int, str]] = []
-            for page_idx in range(total_pages):
-                try:
-                    page = doc[page_idx]
-                    page_text = page.get_text().strip()
-                    if len(page_text) > 50:
-                        text_pages.append((page_idx, page_text))
-                    else:
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                        img_b64 = base64.standard_b64encode(pix.tobytes("png")).decode("utf-8")
-                        image_pages.append((page_idx, img_b64))
-                except Exception as e:
-                    print(f"[WARN] Could not read page {page_idx + 1} of {filename}: {e}")
-            doc.close()
+            txs = await _call_gemini(pdf_bytes, filename)
 
-            readable_pages = len(text_pages) + len(image_pages)
-            jobs[job_id]["total_pages"] = readable_pages
-            pages_done = 0
+            needs_retry = False
+            if len(txs) == 0:
+                print(f"[WARN] {filename}: Gemini returned 0 transactions, retrying…")
+                needs_retry = True
+            elif len(txs) < 3 and total_pages > 5:
+                print(f"[WARN] {filename}: Only {len(txs)} transactions for {total_pages}-page file, retrying…")
+                needs_retry = True
 
-            for i in range(0, len(text_pages), TEXT_CHUNK):
-                batch = text_pages[i:i + TEXT_CHUNK]
-                first_p, last_p = batch[0][0] + 1, batch[-1][0] + 1
+            if needs_retry:
                 jobs[job_id]["current_file"] = (
-                    f"Processing file {file_idx + 1} of {total_files}: {filename} "
-                    f"(pages {first_p}–{last_p} of {total_pages})"
+                    f"Processing file {file_idx + 1} of {total_files}: {filename} (retrying…)"
                 )
-                combined = "\n\n".join(
-                    f"--- Page {pi + 1} of {total_pages} ---\n{txt}" for pi, txt in batch
-                )
-                content = [{"type": "text", "text": PROMPT + f"\n\n{combined}"}]
-                txs = await _call_claude(content)
-                all_transactions.extend(txs)
-                pages_done += len(batch)
-                jobs[job_id]["pages_done"] = pages_done
-                print(f"[INFO] Text batch pages {first_p}-{last_p} of {filename}: {len(txs)} transactions")
+                txs = await _call_gemini(pdf_bytes, filename)
+                if len(txs) == 0 or (len(txs) < 3 and total_pages > 5):
+                    print(f"[WARN] {filename}: Retry also returned {len(txs)} transactions, continuing…")
 
-            for i in range(0, len(image_pages), IMAGE_CHUNK):
-                batch = image_pages[i:i + IMAGE_CHUNK]
-                first_p, last_p = batch[0][0] + 1, batch[-1][0] + 1
-                jobs[job_id]["current_file"] = (
-                    f"Processing file {file_idx + 1} of {total_files}: {filename} "
-                    f"(scanned pages {first_p}–{last_p} of {total_pages})"
-                )
-                content: list = [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}}
-                    for _, img_b64 in batch
-                ]
-                content.append({
-                    "type": "text",
-                    "text": PROMPT + f"\n\n(Pages {first_p}–{last_p} of {total_pages} shown above as images)",
-                })
-                txs = await _call_claude(content)
-                all_transactions.extend(txs)
-                pages_done += len(batch)
-                jobs[job_id]["pages_done"] = pages_done
-                print(f"[INFO] Image batch pages {first_p}-{last_p} of {filename}: {len(txs)} transactions")
+            all_transactions.extend(txs)
+            jobs[job_id]["pages_done"] = total_pages
+            print(f"[INFO] {filename}: {len(txs)} transactions extracted")
 
         if all_transactions:
             all_transactions = deduplicate_categories(all_transactions)
@@ -1373,3 +1362,4 @@ def export_excel(session_id: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=f"bank_statement_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
     )
+
