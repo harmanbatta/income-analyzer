@@ -743,7 +743,7 @@ async def _call_gemini(pdf_bytes: bytes, filename: str) -> list:
             if gemini_file.state.name != "ACTIVE":
                 raise RuntimeError(f"Gemini file not active: {gemini_file.state.name}")
 
-            model = genai.GenerativeModel("gemini-2.5-pro")
+            model = genai.GenerativeModel("gemini-2.5-flash")
             response = model.generate_content([gemini_file, PROMPT])
             response_text = response.text.strip()
 
