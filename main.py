@@ -784,9 +784,41 @@ def _extract_raw_transactions(pdf_bytes: bytes, filename: str) -> list[str]:
 
 async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
     """Background task: two-stage pipeline — deterministic extraction then Claude categorization."""
-    BATCH_SIZE = 50
+    SPLIT_THRESHOLD = 800
     all_transactions: list = []
     total_files = len(file_data)
+
+    async def _call_claude(lines: list[str], filename: str, call_label: str) -> list:
+        batch_text = '\n'.join(lines)
+        prompt_text = (
+            PROMPT +
+            f"\n\nThe following are raw transaction lines already extracted from {filename}. "
+            "Your job is ONLY to categorize and classify each line — do not skip any. "
+            "Return the full JSON structure for every line below:\n\n" +
+            batch_text
+        )
+
+        def _sync(pt=prompt_text) -> str:
+            with client.messages.stream(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=8000,
+                messages=[{"role": "user", "content": pt}],
+            ) as stream:
+                return stream.get_final_text().strip()
+
+        try:
+            response_text = await asyncio.to_thread(_sync)
+            raw = extract_json_transactions(response_text)
+            result = []
+            for tx in raw:
+                tx = normalize_transaction(tx)
+                tx["id"] = str(uuid.uuid4())
+                result.append(tx)
+            print(f"[INFO] {filename} {call_label}: {len(result)} transactions categorized")
+            return result
+        except Exception as e:
+            print(f"[WARN] Claude categorization error for {filename} {call_label}: {e}")
+            return []
 
     try:
         for file_idx, (filename, pdf_bytes) in enumerate(file_data):
@@ -803,46 +835,30 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
                 print(f"[WARN] {filename}: no transaction lines found by pdfplumber, skipping")
                 continue
 
-            total_batches = (len(raw_lines) + BATCH_SIZE - 1) // BATCH_SIZE
-            jobs[job_id]["total_pages"] = total_batches
-
-            # Stage 2 — Claude Haiku categorization in batches of 50
-            for batch_num, i in enumerate(range(0, len(raw_lines), BATCH_SIZE), 1):
-                batch = raw_lines[i:i + BATCH_SIZE]
+            # Stage 2 — single Claude call; split into two calls only if > 800 lines
+            if len(raw_lines) <= SPLIT_THRESHOLD:
+                jobs[job_id].update({
+                    "current_file": f"Processing file {file_idx + 1} of {total_files}: {filename} (Stage 2: categorizing {len(raw_lines)} transactions…)",
+                    "total_pages": 1,
+                })
+                txs = await _call_claude(raw_lines, filename, "call 1/1")
+                all_transactions.extend(txs)
+                jobs[job_id]["pages_done"] = 1
+            else:
+                mid = len(raw_lines) // 2
+                jobs[job_id].update({
+                    "current_file": f"Processing file {file_idx + 1} of {total_files}: {filename} (Stage 2: categorizing call 1 of 2…)",
+                    "total_pages": 2,
+                })
+                txs1 = await _call_claude(raw_lines[:mid], filename, "call 1/2")
+                all_transactions.extend(txs1)
+                jobs[job_id]["pages_done"] = 1
                 jobs[job_id]["current_file"] = (
-                    f"Processing file {file_idx + 1} of {total_files}: {filename} "
-                    f"(Stage 2: categorizing batch {batch_num} of {total_batches}…)"
+                    f"Processing file {file_idx + 1} of {total_files}: {filename} (Stage 2: categorizing call 2 of 2…)"
                 )
-
-                batch_text = '\n'.join(batch)
-                prompt_text = (
-                    PROMPT +
-                    f"\n\nThe following are raw transaction lines already extracted from {filename}. "
-                    "Your job is ONLY to categorize and classify each line — do not skip any. "
-                    "Return the full JSON structure for every line below:\n\n" +
-                    batch_text
-                )
-
-                def _sync(pt=prompt_text) -> str:
-                    with client.messages.stream(
-                        model="claude-haiku-4-5-20251001",
-                        max_tokens=16000,
-                        messages=[{"role": "user", "content": pt}],
-                    ) as stream:
-                        return stream.get_final_text().strip()
-
-                try:
-                    response_text = await asyncio.to_thread(_sync)
-                    raw = extract_json_transactions(response_text)
-                    for tx in raw:
-                        tx = normalize_transaction(tx)
-                        tx["id"] = str(uuid.uuid4())
-                        all_transactions.append(tx)
-                    print(f"[INFO] {filename} batch {batch_num}/{total_batches}: {len(raw)} transactions categorized")
-                except Exception as e:
-                    print(f"[WARN] Claude categorization error for {filename} batch {batch_num}: {e}")
-
-                jobs[job_id]["pages_done"] = batch_num
+                txs2 = await _call_claude(raw_lines[mid:], filename, "call 2/2")
+                all_transactions.extend(txs2)
+                jobs[job_id]["pages_done"] = 2
 
             print(f"[INFO] {filename}: complete")
 
