@@ -748,19 +748,22 @@ def _extract_pdf_text(pdf_bytes: bytes, filename: str) -> str:
 
 
 def _identify_transaction_lines(full_text: str) -> list[str]:
-    """Pass all meaningful lines to Claude — let Claude decide what is a transaction."""
-    skip_re = re.compile(
-        r'^[\-=]+$'                                                    # separator lines
-        r'|^\d+$'                                                      # lone page numbers
-        r'|^(Page|Statement|Balance Forward|Opening Balance|Closing Balance)\b',
-        re.IGNORECASE,
-    )
-    lines = []
-    for line in full_text.splitlines():
+    lines = full_text.split('\n')
+    kept = []
+    skip_keywords = ['opening balance', 'closing balance', 'balance forward',
+                     'statement period', 'account number', 'page ', 'total ']
+    for line in lines:
         line = line.strip()
-        if len(line) >= 3 and not skip_re.match(line):
-            lines.append(line)
-    return lines
+        if not line:
+            continue
+        if len(line) < 3:
+            continue
+        if line.replace('-', '').replace('=', '').replace('*', '').strip() == '':
+            continue
+        if any(kw in line.lower() for kw in skip_keywords):
+            continue
+        kept.append(line)
+    return kept
 
 
 async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
