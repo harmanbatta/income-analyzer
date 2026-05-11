@@ -1,4 +1,4 @@
-﻿import os
+﻿﻿import os
 import json
 import re
 import base64
@@ -9,9 +9,10 @@ from collections import Counter
 from datetime import datetime
 from typing import Optional
 
-import time
-import google.generativeai as genai
-import fitz  # PyMuPDF
+import io
+
+import anthropic
+import pdfplumber
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
@@ -22,7 +23,11 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.formatting.rule import CellIsRule
 
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+if not ANTHROPIC_API_KEY:
+    raise RuntimeError("ANTHROPIC_API_KEY environment variable is required")
+
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 sessions: dict[str, dict] = {}
 jobs: dict[str, dict] = {}
 _running_tasks: set = set()
@@ -727,109 +732,119 @@ def health():
     return {"status": "ok"}
 
 
-async def _call_gemini(pdf_bytes: bytes, filename: str) -> list:
-    """Upload entire PDF to Gemini 1.5 Pro, extract transactions, then delete the upload."""
-    def _sync() -> list:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(pdf_bytes)
-            tmp_path = tmp.name
+def _extract_raw_transactions(pdf_bytes: bytes, filename: str) -> list[str]:
+    """Stage 1: Deterministic extraction of transaction lines from PDF using pdfplumber."""
+    date_re = re.compile(
+        r'(?:\d{1,2}/\d{1,2}/\d{2,4})'        # DD/MM/YY or DD/MM/YYYY or MM/DD/YYYY
+        r'|(?:[A-Za-z]{3}\.?\s+\d{1,2})'       # MMM DD or MMM. DD
+        r'|(?:\d{4}-\d{2}-\d{2})'              # YYYY-MM-DD
+        r'|(?:\d{1,2}-[A-Za-z]{3}-\d{2,4})'   # DD-MMM-YY or DD-MMM-YYYY
+    )
+    amount_re = re.compile(r'\d[\d,]*\.\d{2}')
 
-        gemini_file = None
-        try:
-            gemini_file = genai.upload_file(tmp_path, mime_type="application/pdf")
-            while gemini_file.state.name == "PROCESSING":
-                time.sleep(2)
-                gemini_file = genai.get_file(gemini_file.name)
-            if gemini_file.state.name != "ACTIVE":
-                raise RuntimeError(f"Gemini file not active: {gemini_file.state.name}")
-
-            model = genai.GenerativeModel("gemini-2.5-flash")
-            response = model.generate_content([gemini_file, PROMPT])
-            response_text = response.text.strip()
-
-            raw = extract_json_transactions(response_text)
-            result = []
-            for tx in raw:
-                tx = normalize_transaction(tx)
-                tx["id"] = str(uuid.uuid4())
-                result.append(tx)
-            return result
-        except Exception as e:
-            print(f"[WARN] Gemini API/parse error for {filename}: {e}")
-            return []
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-            if gemini_file is not None:
-                try:
-                    gemini_file.delete()
-                except Exception as e:
-                    print(f"[WARN] Could not delete Gemini file for {filename}: {e}")
+    raw_lines: list[str] = []
+    seen: set[str] = set()
 
     try:
-        return await asyncio.to_thread(_sync)
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                # Try table extraction first (more structured)
+                tables = page.extract_tables() or []
+                table_rows: set[str] = set()
+                for table in tables:
+                    for row in table:
+                        if not row:
+                            continue
+                        row_text = ' '.join(str(cell or '').strip() for cell in row if cell)
+                        row_text = ' '.join(row_text.split())
+                        if not row_text:
+                            continue
+                        if date_re.search(row_text) and amount_re.search(row_text):
+                            if row_text not in seen:
+                                seen.add(row_text)
+                                raw_lines.append(row_text)
+                                table_rows.add(row_text)
+
+                # Also scan plain text lines for any transactions not captured in tables
+                text = page.extract_text() or ""
+                for line in text.splitlines():
+                    line = ' '.join(line.split())
+                    if not line:
+                        continue
+                    if date_re.search(line) and amount_re.search(line):
+                        if line not in seen:
+                            seen.add(line)
+                            raw_lines.append(line)
     except Exception as e:
-        print(f"[WARN] Gemini thread error for {filename}: {e}")
-        return []
+        print(f"[WARN] pdfplumber extraction error for {filename}: {e}")
+
+    print(f"[INFO] {filename}: extracted {len(raw_lines)} raw transaction lines")
+    return raw_lines
 
 
 async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
-    """Background task: process PDFs one at a time and store results in jobs dict."""
+    """Background task: two-stage pipeline — deterministic extraction then Claude categorization."""
+    BATCH_SIZE = 50
     all_transactions: list = []
     total_files = len(file_data)
 
     try:
         for file_idx, (filename, pdf_bytes) in enumerate(file_data):
             jobs[job_id].update({
-                "current_file": f"Processing file {file_idx + 1} of {total_files}: {filename}",
+                "current_file": f"Processing file {file_idx + 1} of {total_files}: {filename} (Stage 1: extracting…)",
                 "pages_done": 0,
                 "total_pages": 0,
             })
 
-            try:
-                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                total_pages = len(doc)
-                doc.close()
-            except Exception as e:
-                jobs[job_id] = {
-                    "status": "error",
-                    "error": f"Could not open {filename}: {e}",
-                    "current_file": f"Failed on file {file_idx + 1} of {total_files}: {filename}",
-                    "pages_done": 0,
-                    "total_pages": 0,
-                }
-                return
+            # Stage 1 — deterministic extraction
+            raw_lines = await asyncio.to_thread(_extract_raw_transactions, pdf_bytes, filename)
 
-            print(f"[INFO] {filename}: {total_pages} page(s)")
-            jobs[job_id]["total_pages"] = total_pages
-            jobs[job_id]["current_file"] = (
-                f"Processing file {file_idx + 1} of {total_files}: {filename} "
-                f"(uploading {total_pages} pages to Gemini…)"
-            )
+            if not raw_lines:
+                print(f"[WARN] {filename}: no transaction lines found by pdfplumber, skipping")
+                continue
 
-            txs = await _call_gemini(pdf_bytes, filename)
+            total_batches = (len(raw_lines) + BATCH_SIZE - 1) // BATCH_SIZE
+            jobs[job_id]["total_pages"] = total_batches
 
-            needs_retry = False
-            if len(txs) == 0:
-                print(f"[WARN] {filename}: Gemini returned 0 transactions, retrying…")
-                needs_retry = True
-            elif len(txs) < 3 and total_pages > 5:
-                print(f"[WARN] {filename}: Only {len(txs)} transactions for {total_pages}-page file, retrying…")
-                needs_retry = True
-
-            if needs_retry:
+            # Stage 2 — Claude Haiku categorization in batches of 50
+            for batch_num, i in enumerate(range(0, len(raw_lines), BATCH_SIZE), 1):
+                batch = raw_lines[i:i + BATCH_SIZE]
                 jobs[job_id]["current_file"] = (
-                    f"Processing file {file_idx + 1} of {total_files}: {filename} (retrying…)"
+                    f"Processing file {file_idx + 1} of {total_files}: {filename} "
+                    f"(Stage 2: categorizing batch {batch_num} of {total_batches}…)"
                 )
-                txs = await _call_gemini(pdf_bytes, filename)
-                if len(txs) == 0 or (len(txs) < 3 and total_pages > 5):
-                    print(f"[WARN] {filename}: Retry also returned {len(txs)} transactions, continuing…")
 
-            all_transactions.extend(txs)
-            jobs[job_id]["pages_done"] = total_pages
-            print(f"[INFO] {filename}: {len(txs)} transactions extracted")
+                batch_text = '\n'.join(batch)
+                prompt_text = (
+                    PROMPT +
+                    f"\n\nThe following are raw transaction lines already extracted from {filename}. "
+                    "Your job is ONLY to categorize and classify each line — do not skip any. "
+                    "Return the full JSON structure for every line below:\n\n" +
+                    batch_text
+                )
+
+                def _sync(pt=prompt_text) -> str:
+                    with client.messages.stream(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=16000,
+                        messages=[{"role": "user", "content": pt}],
+                    ) as stream:
+                        return stream.get_final_text().strip()
+
+                try:
+                    response_text = await asyncio.to_thread(_sync)
+                    raw = extract_json_transactions(response_text)
+                    for tx in raw:
+                        tx = normalize_transaction(tx)
+                        tx["id"] = str(uuid.uuid4())
+                        all_transactions.append(tx)
+                    print(f"[INFO] {filename} batch {batch_num}/{total_batches}: {len(raw)} transactions categorized")
+                except Exception as e:
+                    print(f"[WARN] Claude categorization error for {filename} batch {batch_num}: {e}")
+
+                jobs[job_id]["pages_done"] = batch_num
+
+            print(f"[INFO] {filename}: complete")
 
         if all_transactions:
             all_transactions = deduplicate_categories(all_transactions)
@@ -1362,4 +1377,5 @@ def export_excel(session_id: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=f"bank_statement_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
     )
+
 
