@@ -748,18 +748,17 @@ def _extract_pdf_text(pdf_bytes: bytes, filename: str) -> str:
 
 
 def _identify_transaction_lines(full_text: str) -> list[str]:
-    """Filter lines that contain a date pattern AND a decimal amount — likely transaction rows."""
-    date_re = re.compile(
-        r'(?:\d{1,2}/\d{1,2}/\d{2,4})'             # DD/MM/YY or DD/MM/YYYY
-        r'|(?:[A-Za-z]{3}\.?\s+\d{1,2}[\s,]+\d{4})'# MMM DD YYYY
-        r'|(?:\d{4}-\d{2}-\d{2})'                   # YYYY-MM-DD
-        r'|(?:\d{1,2}-[A-Za-z]{3}-\d{2,4})'         # DD-MMM-YY or DD-MMM-YYYY
+    """Pass all meaningful lines to Claude — let Claude decide what is a transaction."""
+    skip_re = re.compile(
+        r'^[\-=]+$'                                                    # separator lines
+        r'|^\d+$'                                                      # lone page numbers
+        r'|^(Page|Statement|Balance Forward|Opening Balance|Closing Balance)\b',
+        re.IGNORECASE,
     )
-    amount_re = re.compile(r'\d[\d,]*\.\d{2}')
     lines = []
     for line in full_text.splitlines():
         line = line.strip()
-        if line and date_re.search(line) and amount_re.search(line):
+        if len(line) >= 3 and not skip_re.match(line):
             lines.append(line)
     return lines
 
