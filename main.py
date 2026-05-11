@@ -747,8 +747,26 @@ def _extract_pdf_text(pdf_bytes: bytes, filename: str) -> str:
     return full_text
 
 
+def _identify_transaction_lines(full_text: str) -> list[str]:
+    """Filter lines that contain a date pattern AND a decimal amount — likely transaction rows."""
+    date_re = re.compile(
+        r'(?:\d{1,2}/\d{1,2}/\d{2,4})'             # DD/MM/YY or DD/MM/YYYY
+        r'|(?:[A-Za-z]{3}\.?\s+\d{1,2}[\s,]+\d{4})'# MMM DD YYYY
+        r'|(?:\d{4}-\d{2}-\d{2})'                   # YYYY-MM-DD
+        r'|(?:\d{1,2}-[A-Za-z]{3}-\d{2,4})'         # DD-MMM-YY or DD-MMM-YYYY
+    )
+    amount_re = re.compile(r'\d[\d,]*\.\d{2}')
+    lines = []
+    for line in full_text.splitlines():
+        line = line.strip()
+        if line and date_re.search(line) and amount_re.search(line):
+            lines.append(line)
+    return lines
+
+
 async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
-    """Background task: extract full PDF text with fitz then categorize in one Claude call."""
+    """Background task: fitz extraction → transaction line identification → batched Claude categorization."""
+    BATCH_SIZE = 50
     all_transactions: list = []
     total_files = len(file_data)
 
@@ -757,44 +775,84 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
             jobs[job_id].update({
                 "current_file": f"Processing file {file_idx + 1} of {total_files}: {filename} (extracting text…)",
                 "pages_done": 0,
-                "total_pages": 1,
+                "total_pages": 0,
             })
 
-            # Stage 1 — extract full text with fitz
+            # Stage 1 — fitz full-text extraction
             full_text = await asyncio.to_thread(_extract_pdf_text, pdf_bytes, filename)
 
             if not full_text.strip():
                 print(f"[WARN] {filename}: no text extracted, skipping")
                 continue
 
-            # Stage 2 — single Claude Haiku call with full statement text
-            jobs[job_id]["current_file"] = (
-                f"Processing file {file_idx + 1} of {total_files}: {filename} (categorizing with Claude…)"
-            )
+            # Identify transaction lines via date + amount regex
+            tx_lines = _identify_transaction_lines(full_text)
+            print(f"[INFO] {filename}: {len(tx_lines)} transaction lines identified")
 
-            prompt_text = PROMPT + f"\n\n{full_text}"
+            if not tx_lines:
+                print(f"[WARN] {filename}: no transaction lines found, skipping")
+                continue
 
-            def _sync(pt=prompt_text) -> str:
-                with client.messages.stream(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=32000,
-                    messages=[{"role": "user", "content": pt}],
-                ) as stream:
-                    return stream.get_final_text().strip()
+            total_batches = (len(tx_lines) + BATCH_SIZE - 1) // BATCH_SIZE
+            jobs[job_id]["total_pages"] = total_batches
 
-            try:
-                response_text = await asyncio.to_thread(_sync)
-                raw = extract_json_transactions(response_text)
-                for tx in raw:
-                    tx = normalize_transaction(tx)
-                    tx["id"] = str(uuid.uuid4())
-                    all_transactions.append(tx)
-                print(f"[INFO] {filename}: {len(raw)} transactions categorized")
-            except Exception as e:
-                print(f"[WARN] Claude error for {filename}: {e}")
+            file_transactions: list = []
+            category_summary: dict[str, str] = {}  # {category: "Y"/"N"} for cross-batch consistency
 
-            jobs[job_id]["pages_done"] = 1
-            print(f"[INFO] {filename}: complete")
+            # Stage 2 — batched Claude Haiku categorization
+            for batch_num, i in enumerate(range(0, len(tx_lines), BATCH_SIZE), 1):
+                batch = tx_lines[i:i + BATCH_SIZE]
+                jobs[job_id]["current_file"] = (
+                    f"Processing batch {batch_num} of {total_batches} for {filename}"
+                )
+
+                system_prompt = PROMPT
+                if batch_num > 1 and category_summary:
+                    system_prompt += (
+                        f"\n\nPreviously seen categories and their include decisions: {category_summary}"
+                    )
+
+                prompt_text = system_prompt + "\n\n" + "\n".join(batch)
+
+                def _sync(pt=prompt_text) -> str:
+                    with client.messages.stream(
+                        model="claude-haiku-4-5-20251001",
+                        max_tokens=32000,
+                        messages=[{"role": "user", "content": pt}],
+                    ) as stream:
+                        return stream.get_final_text().strip()
+
+                try:
+                    response_text = await asyncio.to_thread(_sync)
+                    raw = extract_json_transactions(response_text)
+                    for tx in raw:
+                        tx = normalize_transaction(tx)
+                        tx["id"] = str(uuid.uuid4())
+                        file_transactions.append(tx)
+                        # Accumulate category→include mapping for next batches
+                        cat = tx.get("category", "")
+                        if cat and cat not in category_summary:
+                            category_summary[cat] = "Y" if tx.get("include", True) else "N"
+                    print(f"[INFO] {filename} batch {batch_num}/{total_batches}: {len(raw)} transactions")
+                except Exception as e:
+                    print(f"[WARN] Claude error for {filename} batch {batch_num}: {e}")
+
+                jobs[job_id]["pages_done"] = batch_num
+
+            # Exact duplicate removal: same date + same description
+            seen_keys: set[tuple] = set()
+            deduped: list = []
+            for tx in file_transactions:
+                key = (tx.get("date", ""), tx.get("description", "").strip().lower())
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    deduped.append(tx)
+            removed = len(file_transactions) - len(deduped)
+            if removed:
+                print(f"[INFO] {filename}: removed {removed} exact duplicate transactions")
+
+            all_transactions.extend(deduped)
+            print(f"[INFO] {filename}: complete — {len(deduped)} unique transactions")
 
         if all_transactions:
             all_transactions = deduplicate_categories(all_transactions)
