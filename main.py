@@ -9,10 +9,8 @@ from collections import Counter
 from datetime import datetime
 from typing import Optional
 
-import io
-
 import anthropic
-import pdfplumber
+import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
@@ -732,134 +730,70 @@ def health():
     return {"status": "ok"}
 
 
-def _extract_raw_transactions(pdf_bytes: bytes, filename: str) -> list[str]:
-    """Stage 1: Deterministic extraction of transaction lines from PDF using pdfplumber."""
-    date_re = re.compile(
-        r'(?:\d{1,2}/\d{1,2}/\d{2,4})'        # DD/MM/YY or DD/MM/YYYY or MM/DD/YYYY
-        r'|(?:[A-Za-z]{3}\.?\s+\d{1,2})'       # MMM DD or MMM. DD
-        r'|(?:\d{4}-\d{2}-\d{2})'              # YYYY-MM-DD
-        r'|(?:\d{1,2}-[A-Za-z]{3}-\d{2,4})'   # DD-MMM-YY or DD-MMM-YYYY
-    )
-    amount_re = re.compile(r'\d[\d,]*\.\d{2}')
-
-    raw_lines: list[str] = []
-    seen: set[str] = set()
-
+def _extract_pdf_text(pdf_bytes: bytes, filename: str) -> str:
+    """Stage 1: Extract all text from every page using PyMuPDF, concatenated into one string."""
+    pages_text: list[str] = []
     try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page_num, page in enumerate(pdf.pages, 1):
-                # Try table extraction first (more structured)
-                tables = page.extract_tables() or []
-                table_rows: set[str] = set()
-                for table in tables:
-                    for row in table:
-                        if not row:
-                            continue
-                        row_text = ' '.join(str(cell or '').strip() for cell in row if cell)
-                        row_text = ' '.join(row_text.split())
-                        if not row_text:
-                            continue
-                        if date_re.search(row_text) and amount_re.search(row_text):
-                            if row_text not in seen:
-                                seen.add(row_text)
-                                raw_lines.append(row_text)
-                                table_rows.add(row_text)
-
-                # Also scan plain text lines for any transactions not captured in tables
-                text = page.extract_text() or ""
-                for line in text.splitlines():
-                    line = ' '.join(line.split())
-                    if not line:
-                        continue
-                    if date_re.search(line) and amount_re.search(line):
-                        if line not in seen:
-                            seen.add(line)
-                            raw_lines.append(line)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for page_num, page in enumerate(doc, 1):
+            text = page.get_text()
+            if text.strip():
+                pages_text.append(f"--- Page {page_num} ---\n{text}")
+        doc.close()
     except Exception as e:
-        print(f"[WARN] pdfplumber extraction error for {filename}: {e}")
-
-    print(f"[INFO] {filename}: extracted {len(raw_lines)} raw transaction lines")
-    return raw_lines
+        print(f"[WARN] fitz extraction error for {filename}: {e}")
+    full_text = "\n\n".join(pages_text)
+    print(f"[INFO] {filename}: extracted {len(full_text)} chars from {len(pages_text)} pages")
+    return full_text
 
 
 async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
-    """Background task: two-stage pipeline — deterministic extraction then Claude categorization."""
-    SPLIT_THRESHOLD = 800
+    """Background task: extract full PDF text with fitz then categorize in one Claude call."""
     all_transactions: list = []
     total_files = len(file_data)
-
-    async def _call_claude(lines: list[str], filename: str, call_label: str) -> list:
-        batch_text = '\n'.join(lines)
-        prompt_text = (
-            PROMPT +
-            f"\n\nThe following are raw transaction lines already extracted from {filename}. "
-            "Your job is ONLY to categorize and classify each line — do not skip any. "
-            "Return the full JSON structure for every line below:\n\n" +
-            batch_text
-        )
-
-        def _sync(pt=prompt_text) -> str:
-            with client.messages.stream(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=8000,
-                messages=[{"role": "user", "content": pt}],
-            ) as stream:
-                return stream.get_final_text().strip()
-
-        try:
-            response_text = await asyncio.to_thread(_sync)
-            raw = extract_json_transactions(response_text)
-            result = []
-            for tx in raw:
-                tx = normalize_transaction(tx)
-                tx["id"] = str(uuid.uuid4())
-                result.append(tx)
-            print(f"[INFO] {filename} {call_label}: {len(result)} transactions categorized")
-            return result
-        except Exception as e:
-            print(f"[WARN] Claude categorization error for {filename} {call_label}: {e}")
-            return []
 
     try:
         for file_idx, (filename, pdf_bytes) in enumerate(file_data):
             jobs[job_id].update({
-                "current_file": f"Processing file {file_idx + 1} of {total_files}: {filename} (Stage 1: extracting…)",
+                "current_file": f"Processing file {file_idx + 1} of {total_files}: {filename} (extracting text…)",
                 "pages_done": 0,
-                "total_pages": 0,
+                "total_pages": 1,
             })
 
-            # Stage 1 — deterministic extraction
-            raw_lines = await asyncio.to_thread(_extract_raw_transactions, pdf_bytes, filename)
+            # Stage 1 — extract full text with fitz
+            full_text = await asyncio.to_thread(_extract_pdf_text, pdf_bytes, filename)
 
-            if not raw_lines:
-                print(f"[WARN] {filename}: no transaction lines found by pdfplumber, skipping")
+            if not full_text.strip():
+                print(f"[WARN] {filename}: no text extracted, skipping")
                 continue
 
-            # Stage 2 — single Claude call; split into two calls only if > 800 lines
-            if len(raw_lines) <= SPLIT_THRESHOLD:
-                jobs[job_id].update({
-                    "current_file": f"Processing file {file_idx + 1} of {total_files}: {filename} (Stage 2: categorizing {len(raw_lines)} transactions…)",
-                    "total_pages": 1,
-                })
-                txs = await _call_claude(raw_lines, filename, "call 1/1")
-                all_transactions.extend(txs)
-                jobs[job_id]["pages_done"] = 1
-            else:
-                mid = len(raw_lines) // 2
-                jobs[job_id].update({
-                    "current_file": f"Processing file {file_idx + 1} of {total_files}: {filename} (Stage 2: categorizing call 1 of 2…)",
-                    "total_pages": 2,
-                })
-                txs1 = await _call_claude(raw_lines[:mid], filename, "call 1/2")
-                all_transactions.extend(txs1)
-                jobs[job_id]["pages_done"] = 1
-                jobs[job_id]["current_file"] = (
-                    f"Processing file {file_idx + 1} of {total_files}: {filename} (Stage 2: categorizing call 2 of 2…)"
-                )
-                txs2 = await _call_claude(raw_lines[mid:], filename, "call 2/2")
-                all_transactions.extend(txs2)
-                jobs[job_id]["pages_done"] = 2
+            # Stage 2 — single Claude Haiku call with full statement text
+            jobs[job_id]["current_file"] = (
+                f"Processing file {file_idx + 1} of {total_files}: {filename} (categorizing with Claude…)"
+            )
 
+            prompt_text = PROMPT + f"\n\n{full_text}"
+
+            def _sync(pt=prompt_text) -> str:
+                with client.messages.stream(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=32000,
+                    messages=[{"role": "user", "content": pt}],
+                ) as stream:
+                    return stream.get_final_text().strip()
+
+            try:
+                response_text = await asyncio.to_thread(_sync)
+                raw = extract_json_transactions(response_text)
+                for tx in raw:
+                    tx = normalize_transaction(tx)
+                    tx["id"] = str(uuid.uuid4())
+                    all_transactions.append(tx)
+                print(f"[INFO] {filename}: {len(raw)} transactions categorized")
+            except Exception as e:
+                print(f"[WARN] Claude error for {filename}: {e}")
+
+            jobs[job_id]["pages_done"] = 1
             print(f"[INFO] {filename}: complete")
 
         if all_transactions:
