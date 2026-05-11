@@ -801,9 +801,9 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
             file_transactions: list = []
             category_summary: dict[str, str] = {}  # {category: "Y"/"N"} for cross-batch consistency
 
-            # Stage 2 — batched Claude Haiku categorization
+            # Stage 2 — sequential non-overlapping batches of 50 lines each
             for batch_num, i in enumerate(range(0, len(tx_lines), BATCH_SIZE), 1):
-                batch = tx_lines[i:i + BATCH_SIZE]
+                batch = tx_lines[i:i + BATCH_SIZE]  # lines i..i+49, never overlapping
                 jobs[job_id]["current_file"] = (
                     f"Processing batch {batch_num} of {total_batches} for {filename}"
                 )
@@ -831,7 +831,6 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
                         tx = normalize_transaction(tx)
                         tx["id"] = str(uuid.uuid4())
                         file_transactions.append(tx)
-                        # Accumulate category→include mapping for next batches
                         cat = tx.get("category", "")
                         if cat and cat not in category_summary:
                             category_summary[cat] = "Y" if tx.get("include", True) else "N"
@@ -841,20 +840,8 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
 
                 jobs[job_id]["pages_done"] = batch_num
 
-            # Exact duplicate removal: same date + same description
-            seen_keys: set[tuple] = set()
-            deduped: list = []
-            for tx in file_transactions:
-                key = (tx.get("date", ""), tx.get("description", "").strip().lower())
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    deduped.append(tx)
-            removed = len(file_transactions) - len(deduped)
-            if removed:
-                print(f"[INFO] {filename}: removed {removed} exact duplicate transactions")
-
-            all_transactions.extend(deduped)
-            print(f"[INFO] {filename}: complete — {len(deduped)} unique transactions")
+            all_transactions.extend(file_transactions)
+            print(f"[INFO] {filename}: complete — {len(file_transactions)} transactions")
 
         if all_transactions:
             all_transactions = deduplicate_categories(all_transactions)
