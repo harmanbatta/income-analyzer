@@ -4,6 +4,7 @@ import re
 import uuid
 import asyncio
 import tempfile
+import base64
 from collections import Counter
 from datetime import datetime
 from typing import Optional
@@ -146,9 +147,9 @@ NUM_TO_MONTH = {v: k.capitalize() for k, v in MONTH_TO_NUM.items()}
 
 # Lines to always discard (matched against lowercased content)
 DISCARD_EXACT = {
+    # BMO
     'transaction details', 'transaction details (continued)',
     'amounts debited', 'amounts credited',
-    'date', 'description',
     'from your account ($)', 'to your account ($)', 'balance ($)',
     '(continued)', 'continued',
     'business banking statement', 'business banking',
@@ -158,7 +159,16 @@ DISCARD_EXACT = {
     'essential plan $0 monthly fee',
     'for questions about your', 'statement call',
     'debited ($)', 'credited ($)', 'balance ($) on',
-    'opening', 'total', 'closing', 'account', '-', '+', '=',
+    # Scotia
+    'your preferred package account summary',
+    'minus total withdrawals', 'plus total deposits',
+    "here's what happened in your account this statement period",
+    'amounts', 'transactions', 'withdrawn ($)', 'deposited ($)',
+    'call 1 800 4-scotia', 'for online account access:',
+    'your account number:', 'questions?',
+    # General
+    'date', 'description', 'opening', 'total', 'closing', 'account',
+    '-', '+', '=', '|',
 }
 
 DISCARD_PATTERNS = [
@@ -194,6 +204,42 @@ def _should_discard(line: str) -> bool:
 
 def _parse_amount(s: str) -> float:
     return float(s.replace(',', ''))
+
+
+def _extract_account_holder(pdf_bytes: bytes) -> str:
+    """
+    Pull the account holder / business name from the first page of any PDF.
+    Used to detect internal same-name e-transfers (savings ↔ chequing).
+    Returns empty string if not found.
+    """
+    try:
+        doc  = fitz.open(stream=pdf_bytes, filetype='pdf')
+        text = doc[0].get_text() if len(doc) > 0 else ""
+        doc.close()
+    except Exception:
+        return ""
+
+    # BMO: "Business name:\n<NAME>"
+    m = re.search(r'Business name:\s*\n?\s*([A-Z][A-Z0-9 &.,\'-]{3,})', text, re.I)
+    if m:
+        return m.group(1).strip()
+
+    # Affinity / generic: "Account Number XXXX - <NAME>"
+    m = re.search(r'Account Number\s+\S+\s*[-–]\s*(.+?)(?:\n|$)', text, re.I)
+    if m:
+        return m.group(1).strip()
+
+    # Scotia / RBC style: bold name block near top (all-caps 2+ words)
+    m = re.search(r'^([A-Z]{2,}(?:\s+[A-Z]{2,}){1,5})\s*$', text, re.M)
+    if m:
+        candidate = m.group(1).strip()
+        # Skip obvious non-names
+        skip = {'ACCOUNT STATEMENT', 'TRANSACTION DETAILS', 'ROYAL BANK', 'TD CANADA TRUST',
+                'CIBC', 'SCOTIABANK', 'BMO', 'AFFINITY', 'WEALTHSIMPLE', 'BALANCE FORWARD'}
+        if candidate not in skip and len(candidate) > 5:
+            return candidate
+
+    return ""
 
 
 def extract_transactions_from_pdf(pdf_bytes: bytes, filename: str) -> list[dict]:
@@ -370,6 +416,7 @@ Before finalising, scan all transactions and fix any conflicts.
 
 Auto-set N:
 - Internal own-account transfers: keywords TFR-FR, transfer from own, same account holder → reason: Internal transfer — not external income.
+- SAME-NAME TRANSFERS (critical): If an e-transfer is received FROM a name that matches or closely resembles the account holder's own business or personal name, it is an internal transfer between the account holder's own accounts (e.g. chequing to savings). Set N, category "Internal Transfer", reason "Internal transfer between own accounts — excluded." Apply this even if the account holder name is not explicitly provided — look for the name that appears on the statement header.
 - NSF reversals and re-credits → reason: NSF reversal — not new income.
 - Government rebates: HST rebate, GST credit, Ontario Trillium Benefit → reason: Government rebate — excluded.
 - Wire transfers (any amount) → reason: Review: wire transfer — verify source and whether qualifying income.
@@ -390,6 +437,7 @@ Auto-set N — never override these rules:
 - ALL bank fees without exception: monthly plan fees, NSF fees, overdraft charges, overdraft per item charges, e-transfer fees, wire fees, service charges, transaction fees, draft fees, excess item fees → category: Bank Charges, reason: Bank fee — excluded.
 - Credit card payments: keywords MC, VISA, AMEX, MASTERCARD, CAN TIRE MC, TD VISA, CIBC VISA, RBC VISA, SCOTIA VISA, BMO MC, or any description combining a card brand with alphanumeric characters → reason: Credit card payment — excluded.
 - Transfers to own accounts at same or other institutions → reason: Internal transfer — excluded.
+- SAME-NAME TRANSFERS (critical): If an e-transfer is sent TO a name that matches or closely resembles the account holder's own business or personal name, it is an internal transfer to the account holder's own savings or other account. Set N, category "Internal Transfer", reason "Internal transfer between own accounts — excluded."
 - CRA, Receiver General, Canada Revenue Agency, or any government tax remittance: keywords CRA, CANADA REVENUE, RECEIVER GENERAL, HST REMIT, GST REMIT, TAX REMIT → category: CRA / Tax Remittance, reason: CRA / government tax remittance — excluded from qualifying expenses. This rule is absolute — never set Y for CRA or Receiver General payments.
 
 Auto-set Y:
@@ -406,6 +454,175 @@ Auto-set Y:
 ── FLAGGING ────────────────────────────────────────────────────────────────
 Unusual, one-time, very large, or unclear transactions → start reason with "Review:" followed by concern.
 """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1b — Claude vision extraction (image-based PDFs)
+# Used when PyMuPDF returns no text (scanned PDFs, image-rendered tables, etc.)
+# Combines extraction + categorisation in one call per page batch.
+# ─────────────────────────────────────────────────────────────────────────────
+
+IMAGE_EXTRACT_PROMPT = """You are a mortgage underwriting analyst reading bank statement images.
+
+Extract EVERY transaction visible in these images and return a JSON array.
+Skip only: opening balance rows, closing balance rows, total/subtotal rows, balance forward rows.
+Include every actual debit and credit — do not skip any.
+
+Each element of the array must have ALL these fields:
+{
+  "date": "YYYY-MM-DD",
+  "description": "exact description text from statement",
+  "amount": 123.45,
+  "direction": "credit" or "debit",
+  "month": "Mon-YY",
+  "category": "...",
+  "suggested_include": "Y" or "N",
+  "reason": "brief reason, max 12 words"
+}
+
+DIRECTION: Look at which column the amount appears in.
+  Deposits / Credits column → "credit"  (money coming in)
+  Withdrawals / Debits column → "debit"  (money going out)
+amount is always a positive number regardless of direction.
+month format example: Apr-24, Jan-25, Mar-26.
+
+CATEGORIES: Use specific labels. Income: INTERAC e-Transfer In, Direct Deposit, Payroll Deposit,
+ATM Deposit, Cheque Deposit, Merchant Services Deposit, Wire Transfer In, or exact sender name.
+Expense: exact payee name or type such as INTERAC e-Transfer Out, Cheque, Mortgage Payment,
+Loan Payment, CC Transfer, Cash Withdrawal, Bank Charges, Merchant Services Fee.
+
+INCOME — Auto N: own-account internal transfers, wire transfers (add "Review:" prefix),
+government rebates (HST/GST credit, OTB), loan/LOC deposits, returned e-transfers, unusually large deposits.
+INCOME — Auto Y: external e-transfers, payroll deposits, direct deposits, merchant card settlements,
+ATM/cash/cheque deposits from third parties.
+
+EXPENSE — Auto N (never override): ALL bank fees (monthly fees, NSF, overdraft, e-transfer fees,
+service charges, cheque image fees), credit card payments (VISA/MC/AMEX/Mastercard bill payments),
+own-account transfers, CRA/Receiver General/government tax payments (PAD CCRA, CRA Source Deduct, etc.).
+EXPENSE — Auto Y: insurance, utilities, loan payments, rent, identifiable merchant purchases,
+e-transfers out to external payees, cheques to third parties.
+
+Return ONLY valid JSON array. No prose, no markdown.
+"""
+
+
+async def _extract_via_vision(pdf_bytes: bytes, filename: str,
+                              extra_context: str = "") -> list[dict]:
+    """
+    Fallback for image-based PDFs: render each page as PNG and send to Claude
+    vision for combined extraction + categorisation.
+    Returns fully-formed transaction dicts (already have category/include/reason).
+    """
+    PAGES_PER_BATCH = 4
+    RENDER_SCALE    = 1.8   # zoom for readable resolution without huge file size
+
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+    except Exception as e:
+        print(f"[WARN] Cannot open {filename} for vision: {e}")
+        return []
+
+    # Detect year from first page text (may still have text in header)
+    year = datetime.now().year
+    first_text = doc[0].get_text() if len(doc) > 0 else ""
+    m = YEAR_RE.search(first_text)
+    if m:
+        year = int(m.group(1))
+
+    # Render all pages
+    page_images: list[tuple[int, bytes]] = []
+    matrix = fitz.Matrix(RENDER_SCALE, RENDER_SCALE)
+    for page_num, page in enumerate(doc, 1):
+        try:
+            pix      = page.get_pixmap(matrix=matrix)
+            img_data = pix.tobytes("png")
+            page_images.append((page_num, img_data))
+        except Exception as e:
+            print(f"[WARN] Could not render page {page_num} of {filename}: {e}")
+    doc.close()
+
+    if not page_images:
+        print(f"[WARN] {filename}: no pages could be rendered")
+        return []
+
+    print(f"[INFO] {filename}: image-based PDF, {len(page_images)} pages → vision extraction")
+
+    all_transactions: list[dict] = []
+
+    for batch_start in range(0, len(page_images), PAGES_PER_BATCH):
+        batch = page_images[batch_start: batch_start + PAGES_PER_BATCH]
+
+        # Build multimodal message content
+        content: list[dict] = []
+        for page_num, img_bytes in batch:
+            content.append({"type": "text", "text": f"Page {page_num}:"})
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": base64.b64encode(img_bytes).decode(),
+                },
+            })
+        content.append({"type": "text", "text": IMAGE_EXTRACT_PROMPT + extra_context})
+
+        def _vision_call(c=content):
+            return client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=16000,
+                messages=[{"role": "user", "content": c}],
+            ).content[0].text.strip()
+
+        try:
+            response_text = await asyncio.to_thread(_vision_call)
+            batch_txs     = extract_json_transactions(response_text)
+            print(f"[INFO] {filename} vision batch pages "
+                  f"{batch[0][0]}-{batch[-1][0]}: {len(batch_txs)} transactions")
+
+            for tx in batch_txs:
+                # Normalise and fill required fields
+                direction = tx.get("direction", "debit").lower()
+                tx_type   = "income" if direction == "credit" else "expense"
+                amount    = abs(float(tx.get("amount", 0)))
+                signed    = amount if tx_type == "income" else -amount
+                inc_flag  = str(tx.get("suggested_include", "Y")).strip().upper() == "Y"
+
+                # Fix date year if Claude guessed wrong
+                date_str = tx.get("date", f"{year}-01-01")
+                if len(date_str) >= 4 and date_str[:4].isdigit():
+                    pass  # year already present
+                else:
+                    date_str = f"{year}-{date_str}"
+
+                # Fix month field
+                month_str = tx.get("month", "")
+                if not month_str:
+                    try:
+                        dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+                        month_str = dt.strftime("%b-%y")
+                    except Exception:
+                        month_str = f"Unk-{str(year)[2:]}"
+
+                all_transactions.append({
+                    "id":               str(uuid.uuid4()),
+                    "date":             date_str[:10],
+                    "description":      tx.get("description", ""),
+                    "amount":           signed,
+                    "type":             tx_type,
+                    "month":            month_str,
+                    "category":         tx.get("category", "Other"),
+                    "suggested_include": tx.get("suggested_include", "Y"),
+                    "reason":           tx.get("reason", ""),
+                    "include":          inc_flag,
+                    "_vision":          True,   # flag: already categorised
+                })
+
+        except Exception as e:
+            print(f"[WARN] Vision extraction failed for {filename} "
+                  f"pages {batch[0][0]}-{batch[-1][0]}: {e}")
+
+    print(f"[INFO] {filename}: vision complete — {len(all_transactions)} transactions")
+    return all_transactions
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1044,23 +1261,69 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
                 "total_pages":  0,
             })
 
-            # ── Stage 1: Python structured extraction ─────────────────────────
+            # ── Stage 1a: Try Python text extraction ──────────────────────────
             raw_txs = await asyncio.to_thread(
                 extract_transactions_from_pdf, pdf_bytes, filename
             )
 
+            # Extract account holder name for same-name transfer detection
+            account_holder = await asyncio.to_thread(
+                _extract_account_holder, pdf_bytes
+            )
+            if account_holder:
+                print(f"[INFO] {filename}: account holder detected — '{account_holder}'")
+
+            # Build account-holder context injected into both prompts
+            acct_context = ""
+            if account_holder:
+                acct_context = (
+                    f"\n\nACCOUNT HOLDER NAME: \"{account_holder}\"\n"
+                    f"SAME-NAME RULE: Any e-transfer sent TO or received FROM a name that "
+                    f"matches or closely resembles \"{account_holder}\" is an internal transfer "
+                    f"between the account holder's own accounts (e.g. chequing ↔ savings). "
+                    f"Set suggested_include N, category \"Internal Transfer\", "
+                    f"reason \"Internal transfer between own accounts — excluded.\" "
+                    f"This applies to BOTH the income side (received from own name) AND the "
+                    f"expense side (sent to own name). Never set Y for these.\n"
+                )
+
+            # ── Stage 1b: Fallback to Claude vision for image-based PDFs ─────
             if not raw_txs:
-                print(f"[WARN] {filename}: 0 transactions extracted — "
-                      f"check that this is a supported bank statement format")
+                jobs[job_id]["current_file"] = (
+                    f"File {file_idx+1}/{total_files}: {filename} — "
+                    f"⚠️ Scanned or image-based PDF detected. Reading with vision…"
+                )
+                vision_txs = await _extract_via_vision(
+                    pdf_bytes, filename, extra_context=acct_context
+                )
+
+                if not vision_txs:
+                    print(f"[WARN] {filename}: could not extract transactions "
+                          f"via text or vision — skipping")
+                    continue
+
+                # Vision transactions are already categorised — skip Stage 2
+                all_transactions.extend(vision_txs)
+                jobs[job_id].update({
+                    "pages_done":  1,
+                    "total_pages": 1,
+                    "current_file": (
+                        f"File {file_idx+1}/{total_files}: {filename} — "
+                        f"⚠️ Scanned PDF: {len(vision_txs)} transactions extracted via vision. "
+                        f"For higher accuracy, ask your client to re-download this statement "
+                        f"directly from their online banking portal."
+                    ),
+                })
+                print(f"[INFO] {filename}: vision path complete — "
+                      f"{len(vision_txs)} transactions")
                 continue
 
+            # ── Stage 2: Claude categorisation (text-based PDFs only) ─────────
             print(f"[INFO] {filename}: {len(raw_txs)} transactions ready for categorisation")
-
-            # ── Stage 2: Claude categorisation ────────────────────────────────
             total_batches = (len(raw_txs) + BATCH_SIZE - 1) // BATCH_SIZE
             jobs[job_id]["total_pages"] = total_batches
 
-            categorized: dict[str, dict] = {}   # id → {category, suggested_include, reason}
+            categorized: dict[str, dict] = {}
 
             for batch_num, start in enumerate(range(0, len(raw_txs), BATCH_SIZE), 1):
                 batch = raw_txs[start: start + BATCH_SIZE]
@@ -1069,7 +1332,6 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
                     f"categorising batch {batch_num}/{total_batches}…"
                 )
 
-                # Send only what Claude needs — not re-sending what Python already knows
                 batch_input = [
                     {
                         "id":          tx["id"],
@@ -1082,7 +1344,7 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
                     for tx in batch
                 ]
 
-                prompt = CAT_PROMPT + "\n\nTransactions to categorise:\n" + json.dumps(batch_input)
+                prompt = CAT_PROMPT + acct_context + "\n\nTransactions to categorise:\n" + json.dumps(batch_input)
 
                 def _call(p=prompt) -> str:
                     with client.messages.stream(
@@ -1105,13 +1367,12 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
 
                 jobs[job_id]["pages_done"] = batch_num
 
-            # ── Stage 3: Merge ────────────────────────────────────────────────
+            # ── Stage 3: Merge categorisation with extracted transactions ─────
             file_transactions: list[dict] = []
             for tx in raw_txs:
                 cat      = categorized.get(tx["id"], {})
                 tx_type  = "income" if tx["direction"] == "credit" else "expense"
                 inc_flag = str(cat.get("suggested_include", "Y")).strip().upper() == "Y"
-                # Expenses stored as negative, income as positive
                 signed   = abs(tx["amount"]) if tx_type == "income" else -abs(tx["amount"])
 
                 file_transactions.append({
@@ -1132,6 +1393,9 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
 
         # Dedup categories across all files for cross-batch consistency
         if all_transactions:
+            # Strip internal _vision flag before storing
+            for tx in all_transactions:
+                tx.pop("_vision", None)
             all_transactions = deduplicate_categories(all_transactions)
 
         session_id = str(uuid.uuid4())
