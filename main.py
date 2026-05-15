@@ -161,6 +161,7 @@ NUM_TO_MONTH = {v: k.capitalize() for k, v in MONTH_TO_NUM.items()}
 STOP_SECTIONS = {
     'my cheques', 'my loans', '~ end of statement ~',
     'end of statement', 'loan summary:', 'my cheques & savings account',
+    'total',   # summary row — amounts that follow are section totals, not transactions
 }
 
 # Lines to always discard (matched against lowercased content)
@@ -195,7 +196,7 @@ DISCARD_EXACT = {
     'advances', 'payments', 'principal', 'interest',
     'current interest rate', 'interest paid current year',
     # General
-    'date', 'description', 'opening', 'total', 'closing', 'account',
+    'date', 'description', 'opening', 'closing', 'account',
     '-', '+', '=', '|',
 }
 
@@ -464,7 +465,7 @@ GLOBAL PAYMENTS, TD MERCHANT SERVICES, and any similar payment processor name:
     terminal settlement deposited into the business account. Category: "Merchant Services Deposit",
     suggested_include: Y. NEVER classify these as credit card payments — they are INCOME.
   • direction = debit (money OUT): This is a chargeback, fee, or reversal from the processor.
-    Category: "Merchant Services Fee", suggested_include: N (fees) or Y (large chargebacks worth noting).
+    Category: "Merchant Services Fee", suggested_include: Y — these are legitimate business expenses.
 This rule is absolute — a deposit from ROYAL BANK CENTRAL CARD CENTRE is always income.
 
 ── CONSISTENCY RULE (absolute) ─────────────────────────────────────────────
