@@ -36,6 +36,11 @@ class UpdateTransactionRequest(BaseModel):
     reason: Optional[str] = None
 
 
+class BulkUpdateRequest(BaseModel):
+    description: str          # substring to match (case-insensitive)
+    include: bool             # value to set on all matching transactions
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # JSON extraction utilities (robust parsing of Claude output)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,9 +137,16 @@ def deduplicate_categories(transactions: list) -> list:
 # Works for BMO and most Canadian bank statements with month-day date format.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# A transaction line in the PyMuPDF output always starts with a 3-letter month + day
-DATE_RE   = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}$', re.I)
-AMOUNT_RE = re.compile(r'^-?[\d,]+\.\d{2}$')
+# Date patterns — handles multiple Canadian bank formats:
+#   BMO / Scotia:  "Apr 01"      (month abbr + day, no year)
+#   Affinity:      "3 Mar 2025"  (day + month abbr + 4-digit year)
+DATE_RE = re.compile(
+    r'^(?:'
+    r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}'           # BMO/Scotia
+    r'|\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}'  # Affinity
+    r')$', re.I
+)
+AMOUNT_RE = re.compile(r'^\$?-?[\d,]+\.\d{2}$')   # optional $ prefix (Affinity)
 PERIOD_RE = re.compile(r'for the period ending\s+\S+\s+\d{1,2},?\s+(\d{4})', re.I)
 YEAR_RE   = re.compile(r'\b(20\d{2})\b')
 
@@ -144,6 +156,12 @@ MONTH_TO_NUM = {
     'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12',
 }
 NUM_TO_MONTH = {v: k.capitalize() for k, v in MONTH_TO_NUM.items()}
+
+# When any of these lines appear, stop collecting transactions (non-transaction sections)
+STOP_SECTIONS = {
+    'my cheques', 'my loans', '~ end of statement ~',
+    'end of statement', 'loan summary:', 'my cheques & savings account',
+}
 
 # Lines to always discard (matched against lowercased content)
 DISCARD_EXACT = {
@@ -166,6 +184,16 @@ DISCARD_EXACT = {
     'amounts', 'transactions', 'withdrawn ($)', 'deposited ($)',
     'call 1 800 4-scotia', 'for online account access:',
     'your account number:', 'questions?',
+    # Affinity
+    'my chequing & savings account', 'statement of accounts',
+    'statement reconciliation', 'credit union deposit insurance',
+    'bill payments', 'continued...', 'my account summary',
+    'deposits \u2013 cdn', 'deposits \u2013 usd', 'loans',
+    'withdrawals', 'deposits', 'balance',
+    'business select chequing sub number 001',
+    'business savings sub number 001',
+    'advances', 'payments', 'principal', 'interest',
+    'current interest rate', 'interest paid current year',
     # General
     'date', 'description', 'opening', 'total', 'closing', 'account',
     '-', '+', '=', '|',
@@ -203,7 +231,7 @@ def _should_discard(line: str) -> bool:
 
 
 def _parse_amount(s: str) -> float:
-    return float(s.replace(',', ''))
+    return float(s.replace(',', '').replace('$', ''))
 
 
 def _extract_account_holder(pdf_bytes: bytes) -> str:
@@ -287,20 +315,30 @@ def extract_transactions_from_pdf(pdf_bytes: bytes, filename: str) -> list[dict]
 
     print(f"[INFO] {filename}: year={year}, {len(all_lines)} lines after filtering")
 
-    # Group lines into blocks — each block starts with a date line
+    # Group lines into blocks — each block starts with a date line.
+    # Stop collecting when a section-terminator line is encountered
+    # (e.g. "my cheques", "my loans") to avoid double-counting.
     blocks = []
     current: list[str] = []
+    stopped = False
     for line in all_lines:
+        if line.lower() in STOP_SECTIONS:
+            stopped = True
+            if current:
+                blocks.append(current)
+                current = []
+            break
         if DATE_RE.match(line):
             if current:
                 blocks.append(current)
             current = [line]
         elif current:
             current.append(line)
-    if current:
+    if current and not stopped:
         blocks.append(current)
 
-    print(f"[INFO] {filename}: {len(blocks)} date-prefixed blocks found")
+    print(f"[INFO] {filename}: {len(blocks)} date-prefixed blocks found"
+          + (" (stopped at section terminator)" if stopped else ""))
 
     transactions = []
     prev_balance: float | None = None
@@ -359,13 +397,24 @@ def extract_transactions_from_pdf(pdf_bytes: bytes, filename: str) -> list[dict]
                 else:
                     direction = 'debit'
 
-        # Build date and month strings
-        parts   = date_line.split()
-        m_abbr  = parts[0].capitalize()
-        day     = parts[1].zfill(2)
-        mon_num = MONTH_TO_NUM.get(m_abbr.lower(), '01')
-        full_date   = f"{year}-{mon_num}-{day}"
-        month_field = f"{m_abbr}-{str(year)[2:]}"   # "Apr-26"
+        # Build date and month strings — handle two formats:
+        #   BMO/Scotia: "Apr 01"      → month=parts[0], day=parts[1], year from statement
+        #   Affinity:   "3 Mar 2025"  → day=parts[0], month=parts[1], year=parts[2]
+        parts = date_line.split()
+        if len(parts) == 3 and parts[2].isdigit() and len(parts[2]) == 4:
+            # Affinity format — year is embedded in the date line itself
+            m_abbr  = parts[1].capitalize()
+            day     = parts[0].zfill(2)
+            tx_year = int(parts[2])          # always correct, even across year boundaries
+        else:
+            # BMO / Scotia format
+            m_abbr  = parts[0].capitalize()
+            day     = parts[1].zfill(2)
+            tx_year = year
+
+        mon_num     = MONTH_TO_NUM.get(m_abbr.lower(), '01')
+        full_date   = f"{tx_year}-{mon_num}-{day}"
+        month_field = f"{m_abbr}-{str(tx_year)[2:]}"   # e.g. "Mar-25"
 
         transactions.append({
             'id':          str(uuid.uuid4()),
@@ -403,10 +452,20 @@ Every input transaction must appear in the output with its exact id.
 
 ── CATEGORIES ──────────────────────────────────────────────────────────────
 Use the most specific label from the payee name or transfer type.
-Income: INTERAC e-Transfer In, ATM Deposit, Mobile Deposit, Cheque Deposit, Direct Deposit, Wire Transfer, Cash Deposit, Internal Transfer In, NSF Reversal, Government Rebate, or exact sender name.
+Income: INTERAC e-Transfer In, ATM Deposit, Mobile Deposit, Cheque Deposit, Direct Deposit, Wire Transfer, Cash Deposit, Internal Transfer In, NSF Reversal, Government Rebate, Merchant Services Deposit, or exact sender name.
 Expense: exact payee name (e.g. "Enbridge Gas", "CHIT CHATS BC") or transfer type such as INTERAC e-Transfer Out, Cash Withdrawal, Bank Charges, Cheque, CC Transfer, Transfer Out, Canadian Draft, Merchant Services Fee.
 Special: MSP fees / merchant services fees / POS fees / terminal fees → always "Merchant Services Fee", always Y.
 Use "Other Income" or "Other Expense" only if truly unclear; explain in reason.
+
+── MERCHANT SERVICES DEPOSITS (critical rule) ──────────────────────────────
+ROYAL BANK CENTRAL CARD CENTRE, MONERIS, SQUARE, STRIPE, ELAVON, CHASE PAYMENTECH,
+GLOBAL PAYMENTS, TD MERCHANT SERVICES, and any similar payment processor name:
+  • direction = credit (money IN): This is a merchant services deposit — daily credit card
+    terminal settlement deposited into the business account. Category: "Merchant Services Deposit",
+    suggested_include: Y. NEVER classify these as credit card payments — they are INCOME.
+  • direction = debit (money OUT): This is a chargeback, fee, or reversal from the processor.
+    Category: "Merchant Services Fee", suggested_include: N (fees) or Y (large chargebacks worth noting).
+This rule is absolute — a deposit from ROYAL BANK CENTRAL CARD CENTRE is always income.
 
 ── CONSISTENCY RULE (absolute) ─────────────────────────────────────────────
 Identical or near-identical descriptions must always get identical category and identical suggested_include.
@@ -466,7 +525,10 @@ IMAGE_EXTRACT_PROMPT = """You are a mortgage underwriting analyst reading bank s
 
 Extract EVERY transaction visible in these images and return a JSON array.
 Skip only: opening balance rows, closing balance rows, total/subtotal rows, balance forward rows.
-Include every actual debit and credit — do not skip any.
+IMPORTANT: If you see pages that show physical cheque images (handwritten or printed cheques),
+skip those pages entirely — do not extract amounts from cheque images.
+Only extract from pages showing a transaction table with Date | Description | Withdrawals | Deposits | Balance columns.
+Include every actual debit and credit — do not skip any from the transaction table.
 
 Each element of the array must have ALL these fields:
 {
@@ -896,8 +958,14 @@ HTML = """<!DOCTYPE html>
       '<div class="bg-white border-b border-gray-200 px-6 py-3">' +
         '<div class="max-w-7xl mx-auto flex flex-col sm:flex-row gap-3 items-start sm:items-center justify-between">' +
           '<div class="flex items-center gap-2 flex-wrap">' + filterBtns + '</div>' +
-          '<input id="search-input" type="search" placeholder="Search transactions..." value="' + h(state.search) + '" ' +
-            'class="pl-4 pr-4 py-2 text-sm border border-gray-200 rounded-lg bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-300 focus:border-blue-500 w-60">' +
+          '<div class="flex items-center gap-2">' +
+            '<input id="search-input" type="search" placeholder="Search transactions..." value="' + h(state.search) + '" ' +
+              'class="pl-4 pr-4 py-2 text-sm border border-gray-200 rounded-lg bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-300 focus:border-blue-500 w-52">' +
+            (state.search.trim()
+              ? '<button id="bulk-y-btn" class="px-3 py-2 text-xs font-semibold rounded-lg bg-green-500 text-white hover:bg-green-600 transition-all whitespace-nowrap">Set all Y</button>' +
+                '<button id="bulk-n-btn" class="px-3 py-2 text-xs font-semibold rounded-lg bg-orange-400 text-white hover:bg-orange-500 transition-all whitespace-nowrap">Set all N</button>'
+              : '') +
+          '</div>' +
         '</div>' +
       '</div>' +
       '<div class="flex-1 px-6 py-4 overflow-auto">' +
@@ -1072,6 +1140,10 @@ HTML = """<!DOCTYPE html>
     document.querySelectorAll('[data-toggle]').forEach(function(btn){
       btn.addEventListener('click', function(){ handleToggle(btn.getAttribute('data-toggle')); });
     });
+    var byBtn = document.getElementById('bulk-y-btn');
+    var bnBtn = document.getElementById('bulk-n-btn');
+    if (byBtn) byBtn.addEventListener('click', function(){ handleBulk(true); });
+    if (bnBtn) bnBtn.addEventListener('click', function(){ handleBulk(false); });
     var td = document.getElementById('to-download-btn');
     if (td) td.addEventListener('click', function(){ setState({page:'download', downloaded:false}); });
   }
@@ -1190,6 +1262,31 @@ HTML = """<!DOCTYPE html>
       });
       var done2 = Object.assign({},state.updating); delete done2[txId];
       setState({transactions:revertTxs, updating:done2});
+    }
+  }
+
+  async function handleBulk(include) {
+    if (!state.search.trim() || !state.sessionId) return;
+    var q = state.search.trim();
+    var label = include ? 'Y' : 'N';
+    if (!confirm('Set all transactions matching "' + q + '" to ' + label + '?')) return;
+
+    // Optimistic update
+    var updated = state.transactions.map(function(t){
+      return q && t.description.toLowerCase().indexOf(q.toLowerCase()) >= 0
+        ? Object.assign({}, t, {include: include})
+        : t;
+    });
+    setState({transactions: updated});
+
+    try {
+      await fetch('/sessions/' + state.sessionId + '/transactions/bulk', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({description: q, include: include})
+      });
+    } catch(e) {
+      console.error('Bulk update failed', e);
     }
   }
 
@@ -1485,6 +1582,20 @@ def update_transaction(session_id: str, transaction_id: str, body: UpdateTransac
                 tx["reason"] = body.reason
             return tx
     raise HTTPException(status_code=404, detail="Transaction not found")
+
+
+@app.put("/sessions/{session_id}/transactions/bulk")
+def bulk_update_transactions(session_id: str, body: BulkUpdateRequest):
+    """Set include=Y or N for all transactions whose description matches the given substring."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    q = body.description.lower()
+    updated = 0
+    for tx in sessions[session_id]["transactions"]:
+        if q in tx.get("description", "").lower():
+            tx["include"] = body.include
+            updated += 1
+    return {"updated": updated}
 
 
 @app.get("/sessions/{session_id}/export")
