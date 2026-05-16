@@ -697,16 +697,45 @@ HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Bank Statement Analyzer</title>
+  <title>Sahara Capital &mdash; Income Analyzer</title>
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;1,700&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
+    *  { box-sizing: border-box; }
     @keyframes spin { to { transform: rotate(360deg); } }
     .spin { animation: spin 1s linear infinite; }
-    .clamp2 { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-    body { font-family: system-ui, -apple-system, sans-serif; }
+    .clamp2 { overflow:hidden; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+    body { font-family:'DM Sans',system-ui,sans-serif; background:#e8e4dc; color:#1a1a1a; -webkit-font-smoothing:antialiased; }
+    .sc-serif   { font-family:'Playfair Display',Georgia,serif; font-weight:700; }
+    .sc-badge   { display:inline-block; border:1px solid #c4a050; color:#c4a050; font-size:10px; font-weight:600; letter-spacing:2.5px; text-transform:uppercase; padding:6px 14px; }
+    .sc-hero    { background:#1B3D2C; padding:40px 48px 44px; }
+    .sc-hero-sm { background:#1B3D2C; padding:16px 28px; }
+    .sc-strip   { background:#152E21; display:flex; width:100%; }
+    .sc-strip-cell { flex:1; text-align:center; padding:20px 8px; border-right:1px solid rgba(255,255,255,0.1); }
+    .sc-strip-cell:last-child { border-right:none; }
+    .sc-strip-num  { font-family:'Playfair Display',Georgia,serif; font-size:26px; font-weight:700; color:#c4a050; line-height:1; }
+    .sc-strip-lbl  { font-size:9px; font-weight:600; letter-spacing:1.5px; text-transform:uppercase; color:rgba(255,255,255,0.55); margin-top:5px; }
+    .sc-divider { width:44px; height:3px; background:#c4a050; }
+    .sc-card    { background:#fff; border-left:4px solid #1B3D2C; }
+    .sc-btn     { background:#1B3D2C; color:#fff; font-size:12px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; padding:14px 28px; display:inline-flex; align-items:center; gap:8px; cursor:pointer; border:none; transition:opacity .15s; }
+    .sc-btn:hover { opacity:.88; }
+    .sc-btn:disabled { opacity:.45; cursor:not-allowed; }
+    .sc-btn-gold { background:#c4a050; }
+    .sc-btn-full { width:100%; justify-content:center; }
+    .sc-contact { background:#1B3D2C; display:flex; width:100%; }
+    .sc-contact-info { flex:1; padding:32px 36px; }
+    .sc-contact-cta  { width:38%; background:#c4a050; padding:32px 24px; text-align:center; }
+    @media(max-width:640px) {
+      .sc-hero { padding:28px 22px 32px; }
+      .sc-strip { flex-wrap:wrap; }
+      .sc-strip-cell { width:50%; border-bottom:1px solid rgba(255,255,255,0.1); }
+      .sc-strip-cell:nth-child(1),.sc-strip-cell:nth-child(3) { border-right:1px solid rgba(255,255,255,0.1); }
+      .sc-contact { flex-direction:column; }
+      .sc-contact-cta { width:100%; }
+    }
   </style>
 </head>
-<body class="m-0 p-0 bg-gray-50">
+<body class="m-0 p-0">
 <div id="app"></div>
 <script>
 (function() {
@@ -811,88 +840,129 @@ HTML = """<!DOCTYPE html>
     }).join('');
 
     var dz = state.isDragging
-      ? 'border-blue-500 bg-blue-50'
-      : 'border-gray-300 bg-white hover:border-blue-400';
+      ? 'border-[#1B3D2C] bg-[#f5f2ec]'
+      : 'border-gray-300 bg-white hover:border-[#1B3D2C]';
     var btnDis = state.isAnalyzing || state.files.length === 0;
     var btnCls = btnDis
       ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
-      : 'bg-blue-600 text-white hover:bg-blue-700 shadow-md hover:shadow-lg active:scale-95';
+      : 'sc-bg text-white hover:opacity-90 shadow-md hover:shadow-lg active:scale-95';
 
-    return '<div class="min-h-screen flex flex-col items-center justify-center p-6 bg-gray-50">' +
-      '<div class="w-full max-w-2xl">' +
-        '<div class="mb-8 text-center">' +
-          '<div class="inline-flex items-center justify-center w-14 h-14 rounded-xl bg-blue-600 mb-4">' +
-            '<svg class="w-7 h-7 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>' +
-          '</div>' +
-          '<h1 class="text-3xl font-bold text-gray-900 tracking-tight">Bank Statement Analyzer</h1>' +
-          '<p class="mt-2 text-gray-500">Upload PDF bank statements for mortgage underwriting analysis</p>' +
+    return (
+      // ── Hero header ────────────────────────────────────────────────
+      '<div class="sc-hero">' +
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:30px">' +
+          '<div class="sc-badge">Income Calculation Tool</div>' +
+          '<img src="https://saharacapital.ca/wp-content/uploads/2026/01/Logo-02.png" alt="Sahara Capital" style="height:52px;width:auto">' +
         '</div>' +
+        '<div style="font-size:10px;font-weight:600;letter-spacing:2px;color:rgba(255,255,255,0.5);text-transform:uppercase;margin-bottom:10px">Team Harman Batta</div>' +
+        '<div class="sc-serif" style="font-size:42px;color:#ffffff;line-height:1.15">Sahara Capital Group</div>' +
+        '<div class="sc-serif" style="font-size:26px;color:#c4a050;font-style:italic;margin-top:6px">by your side, always</div>' +
+        '<div class="sc-divider" style="margin:20px 0"></div>' +
+        '<div style="font-size:19px;color:rgba(255,255,255,0.9);font-weight:600">Income Analyzer</div>' +
+        '<div style="font-size:14px;color:rgba(255,255,255,0.5);margin-top:6px">Upload PDF bank statements for mortgage underwriting analysis</div>' +
+      '</div>' +
 
-        '<!-- Hidden file input — triggered by label below or drag-drop -->' +
-        '<input id="file-input" type="file" accept=".pdf,application/pdf" multiple class="hidden">' +
+      // ── Body ───────────────────────────────────────────────────────
+      '<div style="background:#e8e4dc;padding:32px;min-height:60vh">' +
+        '<div style="max-width:580px;margin:0 auto">' +
 
-        '<!-- Drop zone -->' +
-        '<div id="drop-zone" class="border-2 border-dashed rounded-2xl p-10 text-center transition-all duration-150 ' + dz + '">' +
-          '<div class="flex flex-col items-center gap-4">' +
-            '<div class="p-4 rounded-full ' + (state.isDragging ? 'bg-blue-100' : 'bg-gray-100') + '">' +
-              '<svg class="w-8 h-8 ' + (state.isDragging ? 'text-blue-600' : 'text-gray-400') + '" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>' +
+          // File rows
+          (state.files.length > 0
+            ? '<div style="margin-bottom:16px;display:flex;flex-direction:column;gap:8px">' +
+                state.files.map(function(f,i){
+                  return '<div style="display:flex;align-items:center;justify-content:space-between;background:#fff;border-left:4px solid #1B3D2C;padding:12px 16px">' +
+                    '<div style="display:flex;align-items:center;gap:12px;min-width:0">' +
+                      '<div style="background:#1B3D2C;color:#fff;font-size:9px;font-weight:700;padding:4px 7px;letter-spacing:1px">PDF</div>' +
+                      '<div style="min-width:0">' +
+                        '<p style="font-size:13px;font-weight:600;color:#1a1a1a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + h(f.name) + '</p>' +
+                        '<p style="font-size:11px;color:#999">' + (f.size/1024).toFixed(1) + ' KB</p>' +
+                      '</div>' +
+                    '</div>' +
+                    '<button data-remove="' + i + '" style="background:none;border:none;color:#999;font-size:20px;cursor:pointer;padding:4px 8px;line-height:1">&times;</button>' +
+                  '</div>';
+                }).join('') +
+              '</div>'
+            : '') +
+
+          // Error
+          (state.analyzeError
+            ? '<div style="background:#fff0f0;border-left:4px solid #c0392b;padding:12px 16px;margin-bottom:16px;font-size:13px;color:#c0392b">' + h(state.analyzeError) + '</div>'
+            : '') +
+
+          // Drop zone
+          '<input id="file-input" type="file" accept=".pdf,application/pdf" multiple style="display:none">' +
+          '<div id="drop-zone" style="border:2px dashed ' + (state.isDragging ? '#c4a050' : '#c5bfb5') + ';background:' + (state.isDragging ? '#f5f2ec' : '#fff') + ';padding:48px 24px;text-align:center;transition:all .15s;cursor:pointer;margin-bottom:20px">' +
+            '<div style="margin-bottom:16px">' +
+              '<svg style="width:36px;height:36px;color:' + (state.isDragging ? '#1B3D2C' : '#a0998f') + ';display:inline-block" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>' +
             '</div>' +
-            '<div>' +
-              '<p class="text-base font-semibold text-gray-700">' + (state.isDragging ? 'Drop your PDFs here' : 'Drag &amp; drop PDFs here') + '</p>' +
-              '<p class="text-sm text-gray-400 mt-1">or use the button below to browse</p>' +
-            '</div>' +
-            '<!-- Label-based button: works natively on desktop and mobile without JS tricks -->' +
-            '<label for="file-input" class="inline-flex items-center gap-2 px-5 py-2.5 bg-blue-600 text-white text-sm font-semibold rounded-xl cursor-pointer hover:bg-blue-700 active:scale-95 transition-all shadow-sm select-none">' +
-              '<svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/></svg>' +
+            '<p style="font-weight:600;color:#1B3D2C;font-size:15px;margin-bottom:6px">' + (state.isDragging ? 'Drop your PDFs here' : 'Drag &amp; drop PDFs here') + '</p>' +
+            '<p style="font-size:12px;color:#999;margin-bottom:20px">or use the button below to browse</p>' +
+            '<label for="file-input" class="sc-btn" style="font-size:11px;padding:11px 24px">' +
+              '<svg style="width:14px;height:14px" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13"/></svg>' +
               'Choose PDF Files' +
             '</label>' +
-            '<p class="text-xs text-gray-400">Multiple files supported &mdash; one per month</p>' +
+            '<p style="font-size:11px;color:#bbb;margin-top:14px">Multiple files supported &mdash; one per month</p>' +
           '</div>' +
-        '</div>' +
 
-        (state.files.length > 0 ? '<div class="mt-4 space-y-2">' + fileRows + '</div>' : '') +
-        (state.analyzeError ? '<div class="mt-4 flex items-center gap-3 bg-red-50 border border-red-200 rounded-xl px-4 py-3 text-red-600"><span class="text-lg">&#9888;</span><p class="text-sm">' + h(state.analyzeError) + '</p></div>' : '') +
-        '<button id="analyze-btn" ' + (btnDis ? 'disabled' : '') + ' class="mt-6 w-full py-4 rounded-xl font-semibold text-base flex items-center justify-center gap-3 transition-all duration-200 ' + btnCls + '">' +
-          (state.isAnalyzing
-            ? '<svg class="spin w-5 h-5" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>Uploading files\u2026'
-            : '<svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>Analyze Statements') +
-        '</button>' +
+          // Analyze button
+          '<button id="analyze-btn" ' + (state.isAnalyzing || state.files.length === 0 ? 'disabled' : '') + ' class="sc-btn sc-btn-full" style="font-size:13px;padding:16px 28px;' + (state.isAnalyzing || state.files.length === 0 ? 'opacity:.4;cursor:not-allowed' : '') + '">' +
+            (state.isAnalyzing
+              ? '<svg class="spin" style="width:18px;height:18px" viewBox="0 0 24 24" fill="none"><circle style="opacity:.25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path style="opacity:.75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>Uploading files\u2026'
+              : '<svg style="width:18px;height:18px" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>Analyze Statements') +
+          '</button>' +
+
+        '</div>' +
       '</div>' +
-    '</div>';
+
+      // ── Legal strip ────────────────────────────────────────────────
+      '<div style="background:#f5f2ec;padding:12px 32px;text-align:center">' +
+        '<p style="font-size:10.5px;color:#999">Sahara Capital Group &nbsp;|&nbsp; Mortgage Alliance &nbsp;|&nbsp; FSRA Lic. #10530 &nbsp;|&nbsp; saharacapital.ca</p>' +
+      '</div>'
+    );
   }
 
   /* ============================================================
      PROGRESS PAGE
   ============================================================ */
   function renderProgress() {
-    var info = state.progressInfo || {};
+    var info    = state.progressInfo || {};
     var isError = info.status === 'error';
-    var pct = (info.total_pages > 0) ? Math.round(info.pages_done / info.total_pages * 100) : 0;
-
-    return '<div class="min-h-screen flex flex-col items-center justify-center p-6 bg-gray-50">' +
-      '<div class="w-full max-w-xl">' +
-        '<div class="mb-8 text-center">' +
-          '<div class="inline-flex items-center justify-center w-14 h-14 rounded-xl ' + (isError ? 'bg-red-500' : 'bg-blue-600') + ' mb-4">' +
-            (isError
-              ? '<svg class="w-7 h-7 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>'
-              : '<svg class="spin w-7 h-7 text-white" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>') +
+    var pct     = (info.total_pages > 0) ? Math.round(info.pages_done / info.total_pages * 100) : 0;
+    var spinnerBg = isError ? '#c0392b' : '#1B3D2C';
+    var heroHtml =
+      '<div class="sc-hero-sm" style="display:flex;justify-content:space-between;align-items:center">' +
+        '<div>' +
+          '<div style="font-size:10px;letter-spacing:2px;color:rgba(255,255,255,0.5);text-transform:uppercase">Team Harman Batta</div>' +
+          '<div class="sc-serif" style="font-size:22px;color:#fff;line-height:1.2">Sahara Capital Group</div>' +
+          '<div class="sc-serif" style="font-size:14px;color:#c4a050;font-style:italic">by your side, always</div>' +
+        '</div>' +
+        '<img src="https://saharacapital.ca/wp-content/uploads/2026/01/Logo-02.png" alt="Sahara Capital" style="height:44px;width:auto">' +
+      '</div>';
+    var bodyHtml =
+      '<div style="background:#e8e4dc;min-height:70vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px 24px">' +
+        '<div style="max-width:520px;width:100%">' +
+          '<div style="text-align:center;margin-bottom:28px">' +
+            '<div style="width:60px;height:60px;border-radius:50%;background:' + spinnerBg + ';display:flex;align-items:center;justify-content:center;margin:0 auto 16px">' +
+              (isError
+                ? '<svg style="width:28px;height:28px;color:#fff" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>'
+                : '<svg class="spin" style="width:28px;height:28px;color:#fff" viewBox="0 0 24 24" fill="none"><circle style="opacity:.25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path style="opacity:.75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>') +
+            '</div>' +
+            '<div class="sc-serif" style="font-size:28px;color:#1B3D2C">' + (isError ? 'Analysis Failed' : 'Analyzing Statements') + '</div>' +
+            '<div style="font-size:13px;color:#888;margin-top:6px">' + (isError ? 'An error occurred during processing.' : 'Processing your bank statements\u2026') + '</div>' +
           '</div>' +
-          '<h1 class="text-3xl font-bold text-gray-900 tracking-tight">' + (isError ? 'Analysis Failed' : 'Analyzing Statements') + '</h1>' +
-          '<p class="mt-2 text-gray-500">' + (isError ? 'An error occurred during processing.' : 'Processing your bank statements\u2026') + '</p>' +
+          '<div class="sc-card" style="background:#fff;padding:24px 28px;margin-bottom:20px">' +
+            '<p style="font-size:13px;font-weight:600;color:#1B3D2C;margin-bottom:16px">' + h(info.current_file || 'Starting\u2026') + '</p>' +
+            (info.total_pages > 0
+              ? '<div><div style="display:flex;justify-content:space-between;font-size:11px;color:#999;margin-bottom:8px"><span>Batches categorised</span><span>' + info.pages_done + ' / ' + info.total_pages + '</span></div><div style="width:100%;background:#e8e4dc;height:6px"><div style="background:#1B3D2C;height:6px;width:' + pct + '%;transition:width .5s"></div></div><div style="font-size:11px;color:#c4a050;margin-top:8px;font-weight:600">' + pct + '% complete</div></div>'
+              : '<div style="display:flex;align-items:center;gap:8px;font-size:13px;color:#999"><div style="width:8px;height:8px;background:#1B3D2C;border-radius:50%;animation:spin 1.5s linear infinite"></div><span>Extracting transactions\u2026</span></div>') +
+            (isError ? '<p style="margin-top:16px;font-size:13px;color:#c0392b;background:#fff0f0;padding:12px 16px">' + h(info.error || 'Unknown error') + '</p>' : '') +
+          '</div>' +
+          (isError
+            ? '<button id="retry-btn" class="sc-btn sc-btn-full" style="font-size:13px;padding:16px">\u2190 Back to Upload</button>'
+            : '<p style="text-align:center;font-size:12px;color:#aaa">Checking progress every 5 seconds \u2014 do not close this tab.</p>') +
         '</div>' +
-        '<div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-6 mb-6">' +
-          '<p class="text-sm font-semibold text-gray-700 mb-4">' + h(info.current_file || 'Starting\u2026') + '</p>' +
-          (info.total_pages > 0
-            ? '<div class="mb-1"><div class="flex justify-between text-xs text-gray-400 mb-2"><span>Batches categorised</span><span>' + info.pages_done + ' / ' + info.total_pages + '</span></div>' +
-              '<div class="w-full bg-gray-200 rounded-full h-2"><div class="bg-blue-600 h-2 rounded-full transition-all duration-500" style="width:' + pct + '%"></div></div></div>'
-            : '<div class="flex items-center gap-2 text-gray-400 text-sm"><div class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></div><span>Extracting transactions\u2026</span></div>') +
-          (isError ? '<p class="mt-4 text-sm text-red-600 bg-red-50 rounded-lg p-3">' + h(info.error || 'Unknown error') + '</p>' : '') +
-        '</div>' +
-        (isError
-          ? '<button id="retry-btn" class="w-full py-4 rounded-xl font-semibold text-base bg-blue-600 text-white hover:bg-blue-700 shadow-md hover:shadow-lg transition-all">\u2190 Back to Upload</button>'
-          : '<p class="text-center text-sm text-gray-400">Checking progress every 5 seconds \u2014 do not close this tab.</p>') +
-      '</div>' +
-    '</div>';
+      '</div>';
+    return heroHtml + bodyHtml;
   }
 
   /* ============================================================
@@ -905,100 +975,92 @@ HTML = """<!DOCTYPE html>
     var filterBtns = ['all','income','expense','included','excluded'].map(function(v){
       var labels = {all:'All',income:'Income',expense:'Expenses',included:'Y Only',excluded:'N Only'};
       var active = state.filter === v;
-      return '<button data-filter="' + v + '" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all ' +
-        (active ? 'bg-blue-600 text-white shadow-sm' : 'bg-gray-100 text-gray-600 hover:bg-gray-200') + '">' + labels[v] + '</button>';
+      return '<button data-filter="' + v + '" style="padding:6px 14px;font-size:12px;font-weight:600;border:none;cursor:pointer;transition:all .15s;' + (active ? 'background:#1B3D2C;color:#fff' : 'background:#ede9e1;color:#666') + '">' + labels[v] + '</button>';
     }).join('');
 
     var rows = filtered.length === 0
-      ? '<tr><td colspan="7" class="px-4 py-12 text-center text-gray-400">No transactions match your filters.</td></tr>'
+      ? '<tr><td colspan="7" style="padding:48px;text-align:center;color:#aaa;font-size:14px">No transactions match your filters.</td></tr>'
       : filtered.map(function(tx){
           var upd  = state.updating[tx.id];
-          var rBg  = tx.include ? 'bg-green-50 hover:bg-green-100' : 'bg-orange-50 hover:bg-orange-100';
-          var bCls = upd
-            ? 'opacity-50 cursor-wait bg-gray-300 text-white'
-            : (tx.include ? 'bg-green-500 text-white hover:bg-green-600' : 'bg-orange-400 text-white hover:bg-orange-500');
-          var aCls   = tx.amount >= 0 ? 'text-green-700' : 'text-red-600';
-          var typCls = tx.type === 'income' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-600';
-          return '<tr class="' + rBg + ' transition-colors">' +
-            '<td class="px-4 py-3 font-mono text-xs text-gray-500 whitespace-nowrap">' + h(tx.date) + '</td>' +
-            '<td class="px-4 py-3 text-gray-800 max-w-xs"><span class="clamp2">' + h(tx.description) + '</span></td>' +
-            '<td class="px-4 py-3 text-right font-semibold tabular-nums whitespace-nowrap ' + aCls + '">' + (tx.amount>=0?'+':'') + fmt(tx.amount) + '</td>' +
-            '<td class="px-4 py-3 text-center"><span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ' + typCls + '">' + h(tx.type) + '</span></td>' +
-            '<td class="px-4 py-3 text-gray-500 text-xs">' + h(tx.category) + '</td>' +
-            '<td class="px-4 py-3 text-center"><button data-toggle="' + h(tx.id) + '" ' + (upd?'disabled':'') + ' class="inline-flex items-center justify-center w-12 h-7 rounded-md text-xs font-bold transition-all ' + bCls + '">' +
-              (upd ? '<svg class="spin w-3 h-3" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>' : (tx.include?'Y':'N')) +
+          var rBg  = tx.include ? '#f0faf4' : '#fff8f2';
+          var bBg  = upd ? '#ddd' : (tx.include ? '#27ae60' : '#e67e22');
+          var aCls = tx.amount >= 0 ? 'color:#27ae60' : 'color:#e74c3c';
+          var typBg    = tx.type === 'income' ? '#e8f5ed' : '#fdecea';
+          var typColor = tx.type === 'income' ? '#1c7a40' : '#c0392b';
+          return '<tr style="background:' + rBg + ';border-bottom:1px solid #f0ede8">' +
+            '<td style="padding:11px 14px;font-family:monospace;font-size:11px;color:#999;white-space:nowrap">' + h(tx.date) + '</td>' +
+            '<td style="padding:11px 14px;font-size:12px;color:#1a1a1a;max-width:220px"><span class="clamp2">' + h(tx.description) + '</span></td>' +
+            '<td style="padding:11px 14px;text-align:right;font-weight:700;font-size:13px;white-space:nowrap;' + aCls + '">' + (tx.amount>=0?'+':'') + fmt(tx.amount) + '</td>' +
+            '<td style="padding:11px 14px;text-align:center"><span style="font-size:10px;font-weight:600;padding:3px 8px;background:' + typBg + ';color:' + typColor + '">' + h(tx.type) + '</span></td>' +
+            '<td style="padding:11px 14px;font-size:11px;color:#666">' + h(tx.category) + '</td>' +
+            '<td style="padding:11px 14px;text-align:center"><button data-toggle="' + h(tx.id) + '" ' + (upd?'disabled':'') + ' style="background:' + bBg + ';color:#fff;font-weight:700;font-size:11px;border:none;padding:5px 10px;cursor:pointer;min-width:36px">' +
+              (upd ? '<svg class="spin" style="width:12px;height:12px" viewBox="0 0 24 24" fill="none"><circle style="opacity:.25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path style="opacity:.75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>' : (tx.include?'Y':'N')) +
             '</button></td>' +
-            '<td class="px-4 py-3 text-gray-400 text-xs max-w-xs"><span class="clamp2">' + h(tx.reason) + '</span></td>' +
+            '<td style="padding:11px 14px;font-size:11px;color:#aaa;max-width:200px"><span class="clamp2">' + h(tx.reason) + '</span></td>' +
           '</tr>';
         }).join('');
 
-    function sc(icon, label, value, sub, color) {
-      var c = {blue:'text-blue-600 bg-blue-50',green:'text-green-600 bg-green-50',orange:'text-orange-500 bg-orange-50',red:'text-red-500 bg-red-50'};
-      return '<div class="flex items-center gap-3">' +
-        '<div class="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 font-bold ' + c[color] + '">' + icon + '</div>' +
-        '<div><p class="text-xs text-gray-400 font-medium">' + label + '</p>' +
-        '<p class="text-sm font-bold text-gray-800">' + value + '</p>' +
-        '<p class="text-xs text-gray-400">' + sub + '</p></div></div>';
-    }
-
-    return '<div class="min-h-screen bg-gray-50 flex flex-col">' +
-      '<div class="bg-gray-900 text-white px-6 py-4">' +
-        '<div class="max-w-7xl mx-auto">' +
-          '<h1 class="text-xl font-bold tracking-tight">Bank Statement Review</h1>' +
-          '<p class="text-gray-400 text-sm mt-0.5">Review and toggle transactions for mortgage underwriting</p>' +
-        '</div>' +
-      '</div>' +
-      '<div class="bg-white border-b border-gray-200 px-6 py-4">' +
-        '<div class="max-w-7xl mx-auto grid grid-cols-2 sm:grid-cols-4 gap-4">' +
-          sc('#','Transactions',totals.includedCount+' / '+totals.count,'included','blue') +
-          sc('&uarr;','Total Annual Income',fmt(totals.income),'included only','green') +
-          sc('&darr;','Total Annual Expenses',fmt(totals.expenses),'included only','orange') +
-          sc('$','Net Annual Income',fmt(totals.net),'income minus expenses',totals.net>=0?'green':'red') +
-        '</div>' +
-      '</div>' +
-      '<div class="bg-white border-b border-gray-200 px-6 py-3">' +
-        '<div class="max-w-7xl mx-auto flex flex-col sm:flex-row gap-3 items-start sm:items-center justify-between">' +
-          '<div class="flex items-center gap-2 flex-wrap">' + filterBtns + '</div>' +
-          '<div class="flex items-center gap-2">' +
-            '<input id="search-input" type="search" placeholder="Search transactions..." value="' + h(state.search) + '" ' +
-              'class="pl-4 pr-4 py-2 text-sm border border-gray-200 rounded-lg bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-300 focus:border-blue-500 w-52">' +
-            (state.search.trim()
-              ? '<button id="bulk-y-btn" class="px-3 py-2 text-xs font-semibold rounded-lg bg-green-500 text-white hover:bg-green-600 transition-all whitespace-nowrap">Set all Y</button>' +
-                '<button id="bulk-n-btn" class="px-3 py-2 text-xs font-semibold rounded-lg bg-orange-400 text-white hover:bg-orange-500 transition-all whitespace-nowrap">Set all N</button>'
-              : '') +
+    return (
+      '<div style="min-height:100vh;background:#f5f2ec;display:flex;flex-direction:column">' +
+        '<div class="sc-hero-sm" style="display:flex;justify-content:space-between;align-items:center">' +
+          '<div>' +
+            '<div class="sc-serif" style="font-size:20px;color:#fff">Sahara Capital \u2014 Income Analyzer</div>' +
+            '<div style="font-size:11px;color:rgba(255,255,255,0.5);margin-top:2px">Review and toggle transactions for mortgage underwriting</div>' +
+          '</div>' +
+          '<div style="display:flex;align-items:center;gap:20px">' +
+            '<span class="sc-serif" style="font-size:13px;color:#c4a050;font-style:italic">by your side, always</span>' +
+            '<img src="https://saharacapital.ca/wp-content/uploads/2026/01/Logo-02.png" alt="Sahara Capital" style="height:38px;width:auto">' +
           '</div>' +
         '</div>' +
-      '</div>' +
-      '<div class="flex-1 px-6 py-4 overflow-auto">' +
-        '<div class="max-w-7xl mx-auto">' +
-          '<p class="text-sm text-gray-400 mb-3">Showing ' + filtered.length + ' of ' + state.transactions.length + ' transactions</p>' +
-          '<div class="bg-white rounded-2xl border border-gray-200 overflow-hidden shadow-sm">' +
-            '<div class="overflow-x-auto">' +
-              '<table class="w-full text-sm">' +
-                '<thead><tr class="bg-gray-900 text-gray-300">' +
-                  '<th class="px-4 py-3 text-left font-semibold text-xs uppercase tracking-wider w-28">Date</th>' +
-                  '<th class="px-4 py-3 text-left font-semibold text-xs uppercase tracking-wider">Description</th>' +
-                  '<th class="px-4 py-3 text-right font-semibold text-xs uppercase tracking-wider w-28">Amount</th>' +
-                  '<th class="px-4 py-3 text-center font-semibold text-xs uppercase tracking-wider w-24">Type</th>' +
-                  '<th class="px-4 py-3 text-left font-semibold text-xs uppercase tracking-wider w-40">Category</th>' +
-                  '<th class="px-4 py-3 text-center font-semibold text-xs uppercase tracking-wider w-20">Include</th>' +
-                  '<th class="px-4 py-3 text-left font-semibold text-xs uppercase tracking-wider">Reason</th>' +
-                '</tr></thead>' +
-                '<tbody class="divide-y divide-gray-100">' + rows + '</tbody>' +
-              '</table>' +
+        '<div class="sc-strip">' +
+          '<div class="sc-strip-cell"><div class="sc-strip-num">' + totals.includedCount + ' / ' + totals.count + '</div><div class="sc-strip-lbl">Transactions Included</div></div>' +
+          '<div class="sc-strip-cell"><div class="sc-strip-num">' + fmt(totals.income) + '</div><div class="sc-strip-lbl">Total Annual Income</div></div>' +
+          '<div class="sc-strip-cell"><div class="sc-strip-num">' + fmt(totals.expenses) + '</div><div class="sc-strip-lbl">Total Annual Expenses</div></div>' +
+          '<div class="sc-strip-cell"><div class="sc-strip-num" style="color:' + (totals.net>=0?'#c4a050':'#e74c3c') + '">' + fmt(totals.net) + '</div><div class="sc-strip-lbl">Net Annual Income</div></div>' +
+        '</div>' +
+        '<div style="background:#fff;border-bottom:1px solid #e8e4dc;padding:12px 20px">' +
+          '<div style="max-width:1200px;margin:0 auto;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between">' +
+            '<div style="display:flex;gap:4px;flex-wrap:wrap">' + filterBtns + '</div>' +
+            '<div style="display:flex;align-items:center;gap:8px">' +
+              '<input id="search-input" type="search" placeholder="Search transactions..." value="' + h(state.search) + '" style="padding:8px 14px;font-size:12px;border:1px solid #ddd;background:#faf9f7;outline:none;width:210px">' +
+              (state.search.trim()
+                ? '<button id="bulk-y-btn" style="background:#1B3D2C;color:#fff;font-size:11px;font-weight:700;border:none;padding:8px 14px;cursor:pointer">Set all Y</button>' +
+                  '<button id="bulk-n-btn" style="background:#e67e22;color:#fff;font-size:11px;font-weight:700;border:none;padding:8px 14px;cursor:pointer">Set all N</button>'
+                : '') +
             '</div>' +
           '</div>' +
         '</div>' +
-      '</div>' +
-      '<div class="bg-white border-t border-gray-200 px-6 py-4">' +
-        '<div class="max-w-7xl mx-auto flex justify-end">' +
-          '<button id="to-download-btn" class="flex items-center gap-2 px-6 py-3 bg-green-500 text-white rounded-xl font-semibold hover:bg-green-600 transition-all shadow-md hover:shadow-lg">' +
-            '<svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>' +
-            'Generate Excel Report' +
-          '</button>' +
+        '<div style="flex:1;padding:20px;overflow:auto">' +
+          '<div style="max-width:1200px;margin:0 auto">' +
+            '<p style="font-size:11px;color:#aaa;margin-bottom:10px">Showing ' + filtered.length + ' of ' + state.transactions.length + ' transactions</p>' +
+            '<div style="background:#fff;overflow:hidden">' +
+              '<div style="overflow-x:auto">' +
+                '<table style="width:100%;border-collapse:collapse">' +
+                  '<thead><tr style="background:#1B3D2C">' +
+                    '<th style="padding:11px 14px;text-align:left;font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,0.7);white-space:nowrap">Date</th>' +
+                    '<th style="padding:11px 14px;text-align:left;font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,0.7)">Description</th>' +
+                    '<th style="padding:11px 14px;text-align:right;font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,0.7)">Amount</th>' +
+                    '<th style="padding:11px 14px;text-align:center;font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,0.7)">Type</th>' +
+                    '<th style="padding:11px 14px;text-align:left;font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,0.7)">Category</th>' +
+                    '<th style="padding:11px 14px;text-align:center;font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,0.7)">Include</th>' +
+                    '<th style="padding:11px 14px;text-align:left;font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,0.7)">Reason</th>' +
+                  '</tr></thead>' +
+                  '<tbody>' + rows + '</tbody>' +
+                '</table>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
         '</div>' +
-      '</div>' +
-    '</div>';
+        '<div style="background:#fff;border-top:1px solid #e8e4dc;padding:16px 24px">' +
+          '<div style="max-width:1200px;margin:0 auto;display:flex;justify-content:flex-end">' +
+            '<button id="to-download-btn" class="sc-btn sc-btn-gold" style="font-size:12px;padding:13px 28px">' +
+              '<svg style="width:16px;height:16px" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>' +
+              'Generate Excel Report' +
+            '</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>'
+    );
   }
 
   /* ============================================================
@@ -1009,61 +1071,70 @@ HTML = """<!DOCTYPE html>
     var totalIncome  = inc.filter(function(t){return t.type==='income';}).reduce(function(s,t){return s+t.amount;},0);
     var totalExpenses= inc.filter(function(t){return t.type==='expense';}).reduce(function(s,t){return s+Math.abs(t.amount);},0);
     var net          = totalIncome - totalExpenses;
-    var netColor     = net >= 0 ? 'text-green-700' : 'text-red-600';
-    var dlBtnCls = (state.downloaded ? 'bg-green-500' : 'bg-blue-600 hover:bg-blue-700 hover:shadow-lg') +
-      (state.downloading ? ' opacity-70 cursor-wait' : '');
+    var dlBtnBg      = state.downloaded ? '#1B3D2C' : '#c4a050';
 
-    return '<div class="min-h-screen flex flex-col items-center justify-center p-6 bg-gray-50">' +
-      '<div class="w-full max-w-xl">' +
-        '<div class="text-center mb-8">' +
-          '<div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-green-500 mb-4 shadow-lg">' +
-            '<svg class="w-8 h-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>' +
+    return (
+      '<div class="sc-hero">' +
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:30px">' +
+          '<div class="sc-badge">Analysis Complete</div>' +
+          '<img src="https://saharacapital.ca/wp-content/uploads/2026/01/Logo-02.png" alt="Sahara Capital" style="height:52px;width:auto">' +
+        '</div>' +
+        '<div style="font-size:10px;font-weight:600;letter-spacing:2px;color:rgba(255,255,255,0.5);text-transform:uppercase;margin-bottom:10px">Team Harman Batta</div>' +
+        '<div class="sc-serif" style="font-size:42px;color:#ffffff;line-height:1.15">Sahara Capital Group</div>' +
+        '<div class="sc-serif" style="font-size:26px;color:#c4a050;font-style:italic;margin-top:6px">by your side, always</div>' +
+        '<div class="sc-divider" style="margin:20px 0"></div>' +
+        '<div style="font-size:14px;color:rgba(255,255,255,0.6)">' + inc.length + ' of ' + state.transactions.length + ' transactions included in report</div>' +
+      '</div>' +
+      '<div class="sc-strip">' +
+        '<div class="sc-strip-cell"><div class="sc-strip-num">' + fmt(totalIncome) + '</div><div class="sc-strip-lbl">Total Annual Income</div></div>' +
+        '<div class="sc-strip-cell"><div class="sc-strip-num">' + fmt(totalExpenses) + '</div><div class="sc-strip-lbl">Total Annual Expenses</div></div>' +
+        '<div class="sc-strip-cell"><div class="sc-strip-num" style="color:' + (net>=0?'#c4a050':'#e74c3c') + '">' + fmt(net) + '</div><div class="sc-strip-lbl">Net Annual Income</div></div>' +
+      '</div>' +
+      '<div style="background:#e8e4dc;padding:32px">' +
+        '<div style="max-width:540px;margin:0 auto">' +
+          '<div class="sc-card" style="background:#fff;padding:28px 32px;margin-bottom:20px">' +
+            '<div class="sc-serif" style="font-size:18px;color:#1B3D2C;padding-bottom:12px;border-bottom:2px solid #c4a050;margin-bottom:16px">What\u2019s in the Excel Report</div>' +
+            '<ul style="display:flex;flex-direction:column;gap:10px;font-size:13px;color:#555">' +
+              '<li style="display:flex;gap:10px"><span style="color:#1B3D2C;font-weight:700">\u2713</span> Sheet 1: Summary \u2014 monthly income &amp; expense tables, annual totals, key metrics</li>' +
+              '<li style="display:flex;gap:10px"><span style="color:#1B3D2C;font-weight:700">\u2713</span> Sheet 2: Income Breakdown \u2014 every deposit with Y/N colour coding</li>' +
+              '<li style="display:flex;gap:10px"><span style="color:#1B3D2C;font-weight:700">\u2713</span> Sheet 3: Expense Breakdown \u2014 every withdrawal with Y/N colour coding</li>' +
+              '<li style="display:flex;gap:10px"><span style="color:#1B3D2C;font-weight:700">\u2713</span> AI-generated category and reason for every transaction</li>' +
+            '</ul>' +
           '</div>' +
-          '<h1 class="text-3xl font-bold text-gray-900 tracking-tight">Analysis Complete</h1>' +
-          '<p class="mt-2 text-gray-500">' + inc.length + ' of ' + state.transactions.length + ' transactions included in the report</p>' +
-        '</div>' +
-        '<div class="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden mb-6">' +
-          '<div class="bg-gray-900 px-6 py-4"><h2 class="text-sm font-semibold text-gray-300 uppercase tracking-wider">Underwriting Summary</h2></div>' +
-          '<div class="divide-y divide-gray-100">' +
-            '<div class="flex items-center justify-between px-6 py-4">' +
-              '<div class="flex items-center gap-3"><div class="w-10 h-10 rounded-xl bg-green-100 text-green-600 flex items-center justify-center font-bold">&uarr;</div><p class="text-sm font-medium text-gray-700">Total Annual Income</p></div>' +
-              '<span class="text-xl font-bold text-green-600">' + fmt(totalIncome) + '</span>' +
-            '</div>' +
-            '<div class="flex items-center justify-between px-6 py-4">' +
-              '<div class="flex items-center gap-3"><div class="w-10 h-10 rounded-xl bg-orange-100 text-orange-500 flex items-center justify-center font-bold">&darr;</div><p class="text-sm font-medium text-gray-700">Total Annual Expenses</p></div>' +
-              '<span class="text-xl font-bold text-orange-500">' + fmt(totalExpenses) + '</span>' +
-            '</div>' +
-            '<div class="flex items-center justify-between px-6 py-4 bg-gray-50">' +
-              '<div class="flex items-center gap-3">' +
-                '<div class="w-10 h-10 rounded-xl flex items-center justify-center font-bold ' + (net>=0?'bg-green-100 text-green-700':'bg-red-100 text-red-600') + '">$</div>' +
-                '<div><p class="text-xs text-gray-400 font-medium uppercase tracking-wide">Net Annual Income</p><p class="text-xs text-gray-400">Income minus Expenses</p></div>' +
-              '</div>' +
-              '<span class="text-2xl font-bold ' + netColor + '">' + fmt(net) + '</span>' +
-            '</div>' +
+          '<button id="download-btn" ' + (state.downloading?'disabled':'') + ' class="sc-btn sc-btn-full" style="font-size:13px;padding:16px 28px;margin-bottom:12px;background:' + dlBtnBg + (state.downloading?';opacity:.6;cursor:not-allowed':'') + '">' +
+            (state.downloading
+              ? '<svg class="spin" style="width:18px;height:18px" viewBox="0 0 24 24" fill="none"><circle style="opacity:.25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path style="opacity:.75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>Generating Excel file...'
+              : state.downloaded
+                ? '\u2713 Downloaded! Click to download again'
+                : '<svg style="width:18px;height:18px" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>Download Excel Report (.xlsx)') +
+          '</button>' +
+          '<div style="display:flex;gap:10px">' +
+            '<button id="back-btn" style="flex:1;padding:13px;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;background:#fff;border:1px solid #c5bfb5;color:#666;cursor:pointer">\u2190 Back to Review</button>' +
+            '<button id="reset-btn" style="flex:1;padding:13px;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;background:#ede9e1;border:none;color:#666;cursor:pointer">Analyze New Statements</button>' +
           '</div>' +
-        '</div>' +
-        '<div class="bg-white rounded-2xl border border-gray-200 shadow-sm p-6 mb-6">' +
-          '<h3 class="text-sm font-semibold text-gray-700 mb-3">What&#39;s in the Excel report</h3>' +
-          '<ul class="space-y-2 text-sm text-gray-500">' +
-            '<li>&#10003; Sheet 1: Summary \u2014 monthly income &amp; expense tables, annual totals, key metrics</li>' +
-            '<li>&#10003; Sheet 2: Income Breakdown \u2014 every deposit with Y/N colour coding</li>' +
-            '<li>&#10003; Sheet 3: Expense Breakdown \u2014 every withdrawal with Y/N colour coding</li>' +
-            '<li>&#10003; AI-generated category and reason for every transaction</li>' +
-          '</ul>' +
-        '</div>' +
-        '<button id="download-btn" ' + (state.downloading?'disabled':'') + ' class="w-full py-4 rounded-xl font-semibold text-base flex items-center justify-center gap-3 transition-all shadow-md mb-4 text-white ' + dlBtnCls + '">' +
-          (state.downloading
-            ? '<svg class="spin w-5 h-5" viewBox="0 0 24 24" fill="none"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/></svg>Generating Excel file...'
-            : state.downloaded
-              ? '&#10003; Downloaded! Click to download again'
-              : '<svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>Download Excel Report (.xlsx)') +
-        '</button>' +
-        '<div class="flex gap-3">' +
-          '<button id="back-btn" class="flex-1 py-3 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 border border-gray-200 bg-white text-gray-600 hover:bg-gray-50 transition-all">&larr; Back to Review</button>' +
-          '<button id="reset-btn" class="flex-1 py-3 rounded-xl font-semibold text-sm flex items-center justify-center gap-2 bg-gray-100 text-gray-600 hover:bg-gray-200 transition-all">Analyze New Statements</button>' +
         '</div>' +
       '</div>' +
-    '</div>';
+      '<div class="sc-contact">' +
+        '<div class="sc-contact-info">' +
+          '<div class="sc-serif" style="font-size:26px;color:#fff;margin-bottom:4px">Harman Batta</div>' +
+          '<div style="font-size:10px;font-weight:600;letter-spacing:2px;text-transform:uppercase;color:#c4a050;margin-bottom:4px">Mortgage Broker</div>' +
+          '<div style="font-size:14px;color:rgba(255,255,255,0.7);margin-bottom:16px">Sahara Capital Group</div>' +
+          '<div class="sc-serif" style="font-size:22px;color:#fff;margin-bottom:8px">647-685-9000</div>' +
+          '<a href="mailto:info@saharacapital.ca" style="font-size:13px;color:rgba(255,255,255,0.6);display:block;text-decoration:none;margin-bottom:2px">info@saharacapital.ca</a>' +
+          '<a href="https://saharacapital.ca" style="font-size:13px;color:rgba(255,255,255,0.6);display:block;text-decoration:none">saharacapital.ca</a>' +
+          '<div style="font-size:11px;color:rgba(255,255,255,0.3);margin-top:8px">Serving all of Canada</div>' +
+        '</div>' +
+        '<div class="sc-contact-cta">' +
+          '<div style="font-size:13px;color:#1B3D2C;font-weight:600;line-height:1.5;margin-bottom:16px">Powered by<br>Sahara Capital Group</div>' +
+          '<a href="https://saharacapital.ca" style="display:block;background:#1B3D2C;color:#fff;text-decoration:none;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;padding:13px 20px;text-align:center;margin-bottom:12px">saharacapital.ca</a>' +
+          '<div style="font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:#1B3D2C;margin-top:10px">Mortgage Alliance</div>' +
+          '<div style="font-size:10px;color:rgba(27,61,44,0.6);margin-top:3px">FSRA Lic. #10530</div>' +
+        '</div>' +
+      '</div>' +
+      '<div style="background:#f5f2ec;padding:12px 32px;text-align:center">' +
+        '<p style="font-size:10.5px;color:#999">This tool is for internal mortgage underwriting use only. Sahara Capital Group &nbsp;|&nbsp; saharacapital.ca</p>' +
+      '</div>'
+    );
   }
 
   /* ============================================================
@@ -1859,6 +1930,14 @@ def export_excel(session_id: str):
         ws.conditional_formatting.add(nc, CellIsRule(operator="lessThan",           formula=["0"],  fill=met_fill, font=net_n_fnt))
 
     autofit_columns(ws)
+
+    # ── Branding footer (safe — appended after all existing content/formulas) ──
+    brand_row = S4_DATA_START + len(metrics) + 2
+    bc = ws.cell(row=brand_row, column=1,
+                 value="Prepared by Team Harman Batta  |  Sahara Capital Group  |  Mortgage Alliance  |  FSRA Lic. #10530  |  saharacapital.ca")
+    bc.font = Font(name='Arial', size=9, color='1B3D2C', italic=True)
+    bc.alignment = Alignment(horizontal='left', vertical='center')
+    ws.row_dimensions[brand_row].height = MIN_H
 
     # ── Breakdown sheets ──────────────────────────────────────────────────────
     def build_breakdown_sheet(ws_b, txs):
