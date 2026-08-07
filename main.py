@@ -144,8 +144,15 @@ DATE_RE = re.compile(
     r'^(?:'
     r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}'           # BMO/Scotia
     r'|\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}'  # Affinity
-    r')$', re.I
+    r')\b'   # prefix match only (not full-line) — Affinity sometimes prints the
+             # date and the first word of the description on the same line with
+             # no line break, e.g. "11 Aug 2025 ROYAL BANK CENTRAL CARD CENTRE"
+    , re.I
 )
+# Page-boundary marker inserted between pages so STOP_SECTIONS only ever
+# truncates the CURRENT page/statement, never every remaining page in a
+# multi-month merged PDF.
+_PAGE_BREAK = '\x00PAGE_BREAK\x00'
 AMOUNT_RE = re.compile(r'^\$?-?[\d,]+\.\d{2}$')   # optional $ prefix (Affinity)
 PERIOD_RE = re.compile(r'for the period ending\s+\S+\s+\d{1,2},?\s+(\d{4})', re.I)
 YEAR_RE   = re.compile(r'\b(20\d{2})\b')
@@ -161,7 +168,14 @@ NUM_TO_MONTH = {v: k.capitalize() for k, v in MONTH_TO_NUM.items()}
 STOP_SECTIONS = {
     'my cheques', 'my loans', '~ end of statement ~',
     'end of statement', 'loan summary:', 'my cheques & savings account',
-    'total',   # summary row — amounts that follow are section totals, not transactions
+    # NOTE: the generic word 'total' used to be in this set, but it is too
+    # fragile — e.g. BMO's own account summary table prints "Total" (as two
+    # separate column-header cells) before the real transaction listing even
+    # starts, which silently killed the first several days of every BMO
+    # statement. A stray "Total" subtotal row no longer needs a stop-word:
+    # once a block has its amount+balance pair it self-closes (see the block
+    # builder below), so trailing junk like "Total\n$0.13" after an already
+    # closed block is automatically ignored rather than merged in.
 }
 
 # Lines to always discard (matched against lowercased content)
@@ -193,7 +207,11 @@ DISCARD_EXACT = {
     'withdrawals', 'deposits', 'balance',
     'business select chequing sub number 001',
     'business savings sub number 001',
-    'advances', 'payments', 'principal', 'interest',
+    'advances', 'payments', 'principal',
+    # NOTE: 'interest' intentionally NOT in this set — it's also a legitimate
+    # transaction description (e.g. monthly interest credited on a savings
+    # account). The loan-schedule table it's meant to filter is instead
+    # caught structurally by the "more than 2 amount tokens" safety net below.
     'current interest rate', 'interest paid current year',
     # General
     'date', 'description', 'opening', 'closing', 'account',
@@ -271,7 +289,434 @@ def _extract_account_holder(pdf_bytes: bytes) -> str:
     return ""
 
 
+def _detect_bank(pdf_bytes: bytes) -> str:
+    """Sniff the bank from the first page of text. Returns 'rbc', 'td', or 'other'
+    (BMO/Scotia/Affinity/anything else all use the line-based extractor)."""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+        text = doc[0].get_text() if len(doc) > 0 else ""
+        doc.close()
+    except Exception:
+        return "other"
+    low = text.lower()
+    if 'royal bank of canada' in low or 'rbbda' in low:
+        return 'rbc'
+    if 'td canada trust' in low or 'tdcda' in low or 'toronto-dominion' in low or 'easyweb' in low:
+        return 'td'
+    return 'other'
+
+
 def extract_transactions_from_pdf(pdf_bytes: bytes, filename: str) -> list[dict]:
+    """
+    Top-level dispatcher. RBC and TD statements don't print a debit/credit tag
+    on each line and frequently show multiple transactions per date with only
+    one running balance — text alone can't disambiguate direction, so they use
+    a column-position extractor (reads word bounding boxes to see which column
+    an amount sits under). Every other bank (BMO, Scotia, Affinity) uses the
+    original line-based, balance-delta extractor.
+    """
+    bank = _detect_bank(pdf_bytes)
+    if bank == 'rbc':
+        return _extract_rbc_columnar(pdf_bytes, filename)
+    if bank == 'td':
+        return _extract_td_columnar(pdf_bytes, filename)
+    return _extract_line_based(pdf_bytes, filename)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1a — Column-position extractors (RBC, TD)
+# These banks print two separate amount columns (debit/credit) with no tag on
+# the number itself, and often show several transactions under one date with
+# only the LAST one carrying a running balance. Line-order regex can't safely
+# resolve that, so instead we read each word's x-position via PyMuPDF's word
+# bounding boxes and bucket every amount by which column header it sits under.
+# Rows are reconstructed by clustering words with the same y-coordinate.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MONTH_TO_NUM = MONTH_TO_NUM
+AMOUNT_TOKEN_RE = re.compile(r'^\$?-?[\d,]+\.\d{2}$')
+RBC_DAY_TOKEN_RE = re.compile(r'^\d{1,2}$')
+RBC_MON_TOKEN_RE = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$', re.I)
+TD_DATE_TOKEN_RE = re.compile(r'^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})$', re.I)
+TD_EASYWEB_DATE_RE = re.compile(
+    r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),\s+(\d{4})$', re.I
+)
+COLUMNAR_NON_TX_PREFIXES = (
+    'opening balance', 'closing balance', 'closing totals', 'balance forward',
+    'account fees', 'total',
+)
+
+
+def _group_rows(words: list, y_tol: float = 2.5) -> list[list]:
+    """Cluster PyMuPDF word tuples into visual table rows by y-coordinate."""
+    words = sorted(words, key=lambda w: (w[1], w[0]))
+    rows, current, current_y = [], [], None
+    for w in words:
+        if current_y is None or abs(w[1] - current_y) <= y_tol:
+            current.append(w)
+            current_y = w[1] if current_y is None else min(current_y, w[1])
+        else:
+            rows.append(sorted(current, key=lambda x: x[0]))
+            current, current_y = [w], w[1]
+    if current:
+        rows.append(sorted(current, key=lambda x: x[0]))
+    return rows
+
+
+def _rbc_period(text: str):
+    m = re.search(
+        r'([A-Z][a-z]+)\s+\d{1,2},\s+(\d{4})\s+to\s+([A-Z][a-z]+)\s+\d{1,2},\s+(\d{4})', text
+    )
+    if m:
+        return m.group(1)[:3], int(m.group(2)), m.group(3)[:3], int(m.group(4))
+    return None
+
+
+def _extract_rbc_columnar(pdf_bytes: bytes, filename: str) -> list[dict]:
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+    except Exception as e:
+        print(f"[WARN] fitz error for {filename}: {e}")
+        return []
+
+    transactions: list[dict] = []
+    last_period = None
+    skipped_image_pages: list[int] = []
+
+    for pno, page in enumerate(doc, 1):
+        text = page.get_text()
+        if not text.strip():
+            skipped_image_pages.append(pno)
+            continue
+
+        period = _rbc_period(text)
+        if period:
+            last_period = period
+        start_mon, start_year, end_mon, end_year = last_period or (
+            None, datetime.now().year, None, datetime.now().year
+        )
+
+        words = page.get_text("words")
+        cheques_hits = [w for w in words if w[4] == 'Cheques']
+        if not cheques_hits:
+            print(f"[WARN] {filename} p{pno}: RBC column header not found, skipping page")
+            continue
+        header_y0 = cheques_hits[0][1]
+        same_row = sorted([w for w in words if abs(w[1] - header_y0) <= 2.5], key=lambda w: w[0])
+        hdr = {}
+        paren_hits = [w for w in same_row if w[4] == '($)']
+        if len(paren_hits) >= 3:
+            # The 3 "($)" suffixes on this row, left to right, belong to
+            # Cheques & Debits ($) / Deposits & Credits ($) / Balance ($).
+            hdr['debit'], hdr['credit'], hdr['balance'] = (
+                paren_hits[0][2], paren_hits[1][2], paren_hits[2][2]
+            )
+        for w in same_row:
+            if w[4] == 'Date' and 'date' not in hdr: hdr['date'] = w[2]
+            if w[4] == 'Description' and 'desc' not in hdr: hdr['desc'] = w[2]
+        if len(hdr) < 5:
+            print(f"[WARN] {filename} p{pno}: RBC column header incomplete, skipping page")
+            continue
+
+        debit_credit_mid = (hdr['debit'] + hdr['credit']) / 2
+        credit_balance_mid = (hdr['credit'] + hdr['balance']) / 2
+        # Anchor to the header ROW's own y (header_y0), not a page-wide max of
+        # matching words — a generic word like "Balance" or "Date" can appear
+        # again much further down the page (e.g. in footer text), which would
+        # push this cutoff past the real transaction rows and silently return
+        # zero transactions. This exact bug hit TD's mailed-statement layout:
+        # "NEXT STATEMENT DATE IS AUG 29/25" in the footer contains "DATE".
+        rows = _group_rows([w for w in words if w[1] > header_y0 + 5])
+
+        current_date = None
+        desc_buffer: list[str] = []
+
+        for row in rows:
+            toks = list(row)
+            # Strip leading date tokens. Normally this is a single "29 Jul"
+            # pair, but a row that's the first line on a NEW page repeats the
+            # date as "29 29 Jul Jul" (PyMuPDF duplicates it from a rendering
+            # artifact where the date is drawn once but spans two internal
+            # text runs) — so scan for a leading run of day/month tokens in
+            # ANY order/count rather than assuming a strict alternating pair,
+            # and take whichever day/month values were found.
+            j = 0
+            day_val = mon_val = None
+            while j < len(toks):
+                t = toks[j][4]
+                if RBC_DAY_TOKEN_RE.match(t):
+                    day_val = t.zfill(2)
+                    j += 1
+                elif RBC_MON_TOKEN_RE.match(t):
+                    mon_val = t.capitalize()
+                    j += 1
+                else:
+                    break
+            if day_val and mon_val:
+                current_date = (day_val, mon_val)
+                toks = toks[j:]
+
+            debit_amt = credit_amt = None
+            desc_words = []
+            for w in toks:
+                x1, text_val = w[2], w[4]
+                if AMOUNT_TOKEN_RE.match(text_val):
+                    if x1 < debit_credit_mid:
+                        debit_amt = text_val
+                    elif x1 < credit_balance_mid:
+                        credit_amt = text_val
+                    # else: balance column — informational only, not needed for direction
+                else:
+                    desc_words.append(text_val)
+
+            joined_new = ' '.join(desc_words).strip().lower()
+            if any(joined_new.startswith(p) for p in COLUMNAR_NON_TX_PREFIXES):
+                desc_buffer = []
+                continue
+
+            desc_buffer.extend(desc_words)
+
+            if debit_amt or credit_amt:
+                description = ' '.join(desc_buffer).strip()
+                desc_buffer = []
+                if not current_date or description.lower() in NON_TX_DESCRIPTIONS:
+                    continue
+                day, mon_abbr = current_date
+                mon_num = _MONTH_TO_NUM[mon_abbr.lower()]
+                if start_mon and mon_abbr.lower().startswith(start_mon.lower()):
+                    tx_year = start_year
+                elif end_mon and mon_abbr.lower().startswith(end_mon.lower()):
+                    tx_year = end_year
+                else:
+                    tx_year = end_year
+                full_date = f"{tx_year}-{mon_num}-{day}"
+                month_field = f"{mon_abbr}-{str(tx_year)[2:]}"
+
+                if debit_amt:
+                    amount, direction = _parse_amount(debit_amt), 'debit'
+                else:
+                    amount, direction = _parse_amount(credit_amt), 'credit'
+
+                transactions.append({
+                    'id': str(uuid.uuid4()), 'date': full_date, 'description': description,
+                    'amount': amount, 'direction': direction, 'month': month_field,
+                })
+
+    doc.close()
+
+    if skipped_image_pages:
+        print(f"[WARN] {filename}: {len(skipped_image_pages)} page(s) with no extractable "
+              f"text skipped (pages {skipped_image_pages[0]}-{skipped_image_pages[-1]}) — "
+              f"these are scanned/image pages; ask for a fresh direct download, or split "
+              f"them into a separate file so they hit the vision fallback")
+
+    credits = sum(1 for t in transactions if t['direction'] == 'credit')
+    debits  = sum(1 for t in transactions if t['direction'] == 'debit')
+    print(f"[INFO] {filename}: RBC columnar extraction — {len(transactions)} transactions "
+          f"({credits} credits / {debits} debits)")
+    return transactions
+
+
+def _td_period(text: str):
+    m = re.search(r'([A-Z]{3})\s+(\d{1,2})/(\d{2})\s*-\s*([A-Z]{3})\s+(\d{1,2})/(\d{2})', text)
+    if m:
+        return m.group(1), 2000 + int(m.group(3)), m.group(4), 2000 + int(m.group(6))
+    return None
+
+
+def _extract_td_easyweb_page(words: list, filename: str, pno: int) -> Optional[list[dict]]:
+    """TD's EasyWeb online-banking export: Date | Description | Withdrawals | Deposits |
+    Balance, with full 'Jun 30, 2026' dates (own year, no statement-header lookup needed)."""
+    withdrawals = [w for w in words if w[4] == 'Withdrawals']
+    if not withdrawals:
+        return None
+    header_y0 = withdrawals[0][1]
+    same_row = [w for w in words if abs(w[1] - header_y0) <= 2.5]
+    hdr = {}
+    for w in same_row:
+        # Use right edge (x1) — see comment in _extract_rbc_columnar for why
+        # left-edge bucketing misclassifies short amounts near a boundary.
+        if w[4] == 'Date' and 'date' not in hdr: hdr['date'] = w[2]
+        if w[4] == 'Withdrawals' and 'debit' not in hdr: hdr['debit'] = w[2]
+        if w[4] == 'Deposits' and 'credit' not in hdr: hdr['credit'] = w[2]
+        if w[4] == 'Balance' and 'balance' not in hdr: hdr['balance'] = w[2]
+    if len(hdr) < 4:
+        return None
+
+    debit_credit_mid = (hdr['debit'] + hdr['credit']) / 2
+    credit_balance_mid = (hdr['credit'] + hdr['balance']) / 2
+    # Anchor to the header row's own y (header_y0), not a page-wide max —
+    # see comment in _extract_rbc_columnar for why that's unsafe.
+    rows = _group_rows([w for w in words if w[1] > header_y0 + 5])
+
+    transactions: list[dict] = []
+    current_date = None
+    desc_buffer: list[str] = []
+
+    for row in rows:
+        toks = list(row)
+        joined = ' '.join(t[4] for t in toks[:3])
+        m = TD_EASYWEB_DATE_RE.match(joined)
+        if m:
+            current_date = (m.group(1).capitalize(), m.group(2).zfill(2), m.group(3))
+            toks = toks[3:]
+
+        debit_amt = credit_amt = None
+        desc_words = []
+        for w in toks:
+            x1, text_val = w[2], w[4]
+            if AMOUNT_TOKEN_RE.match(text_val):
+                if x1 < debit_credit_mid:
+                    debit_amt = text_val
+                elif x1 < credit_balance_mid:
+                    credit_amt = text_val
+            else:
+                desc_words.append(text_val)
+
+        joined_new = ' '.join(desc_words).strip().lower()
+        if any(joined_new.startswith(p) for p in COLUMNAR_NON_TX_PREFIXES):
+            desc_buffer = []
+            continue
+
+        desc_buffer.extend(desc_words)
+
+        if debit_amt or credit_amt:
+            description = ' '.join(desc_buffer).strip()
+            desc_buffer = []
+            if not current_date or description.lower() in NON_TX_DESCRIPTIONS:
+                continue
+            mon_abbr, day, year = current_date
+            mon_num = _MONTH_TO_NUM[mon_abbr.lower()]
+            full_date = f"{year}-{mon_num}-{day}"
+            month_field = f"{mon_abbr}-{year[2:]}"
+            if debit_amt:
+                amount, direction = _parse_amount(debit_amt), 'debit'
+            else:
+                amount, direction = _parse_amount(credit_amt), 'credit'
+            transactions.append({
+                'id': str(uuid.uuid4()), 'date': full_date, 'description': description,
+                'amount': amount, 'direction': direction, 'month': month_field,
+            })
+
+    print(f"[INFO] {filename} p{pno}: TD EasyWeb layout detected — {len(transactions)} transactions")
+    return transactions
+
+
+def _extract_td_columnar(pdf_bytes: bytes, filename: str) -> list[dict]:
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+    except Exception as e:
+        print(f"[WARN] fitz error for {filename}: {e}")
+        return []
+
+    transactions: list[dict] = []
+
+    for pno, page in enumerate(doc, 1):
+        text = page.get_text()
+        if not text.strip():
+            continue
+
+        period = _td_period(text)
+        start_mon, start_year, end_mon, end_year = period or (
+            None, datetime.now().year, None, datetime.now().year
+        )
+
+        words = page.get_text("words")
+        debit_hits = [w for w in words if w[4].upper() == 'CHEQUE/DEBIT']
+        hdr = {}
+        if debit_hits:
+            header_y0 = debit_hits[0][1]
+            same_row = [w for w in words if abs(w[1] - header_y0) <= 2.5]
+            for w in same_row:
+                # Right edge (x1) — see comment in _extract_rbc_columnar.
+                wt = w[4].upper()
+                if wt == 'DESCRIPTION' and 'desc' not in hdr: hdr['desc'] = w[2]
+                if wt == 'CHEQUE/DEBIT' and 'debit' not in hdr: hdr['debit'] = w[2]
+                if wt == 'DEPOSIT/CREDIT' and 'credit' not in hdr: hdr['credit'] = w[2]
+                if wt == 'DATE' and 'date' not in hdr: hdr['date'] = w[2]
+                if wt == 'BALANCE' and 'balance' not in hdr: hdr['balance'] = w[2]
+
+        if len(hdr) < 5:
+            # Not the mailed-statement layout — try TD's EasyWeb online-banking export
+            easyweb_txs = _extract_td_easyweb_page(words, filename, pno)
+            if easyweb_txs is not None:
+                transactions.extend(easyweb_txs)
+            else:
+                print(f"[WARN] {filename} p{pno}: no recognized TD layout found, skipping page")
+            continue
+
+        debit_credit_mid = (hdr['debit'] + hdr['credit']) / 2
+        credit_date_mid = (hdr['credit'] + hdr['date']) / 2
+        date_balance_mid = (hdr['date'] + hdr['balance']) / 2
+        # Anchor to the header row's own y (header_y0), not a page-wide max —
+        # see comment in _extract_rbc_columnar for why that's unsafe (TD's
+        # own footer text "NEXT STATEMENT DATE IS AUG 29/25" contains "DATE").
+        rows = _group_rows([w for w in words if w[1] > header_y0 + 5])
+
+        for row in rows:
+            debit_amt = credit_amt = None
+            date_tok = None
+            desc_words = []
+            for w in row:
+                x1, text_val = w[2], w[4]
+                if TD_DATE_TOKEN_RE.match(text_val):
+                    date_tok = text_val.upper()
+                    continue
+                if AMOUNT_TOKEN_RE.match(text_val):
+                    if x1 < debit_credit_mid:
+                        debit_amt = text_val
+                    elif x1 < credit_date_mid:
+                        credit_amt = text_val
+                    elif x1 < date_balance_mid:
+                        pass  # stray token in the date gap — ignore
+                    # else: balance column — informational only
+                else:
+                    desc_words.append(text_val)
+
+            description = ' '.join(desc_words).strip()
+            if not (debit_amt or credit_amt):
+                continue
+            if not date_tok or description.lower() in NON_TX_DESCRIPTIONS:
+                continue
+
+            m = TD_DATE_TOKEN_RE.match(date_tok)
+            mon_abbr, day = m.group(1).capitalize(), m.group(2)
+            mon_num = _MONTH_TO_NUM[mon_abbr.lower()]
+            if start_mon and mon_abbr.upper() == start_mon.upper():
+                tx_year = start_year
+            elif end_mon and mon_abbr.upper() == end_mon.upper():
+                tx_year = end_year
+            else:
+                tx_year = end_year
+            full_date = f"{tx_year}-{mon_num}-{day}"
+            month_field = f"{mon_abbr}-{str(tx_year)[2:]}"
+
+            if debit_amt:
+                amount, direction = _parse_amount(debit_amt), 'debit'
+            else:
+                amount, direction = _parse_amount(credit_amt), 'credit'
+
+            transactions.append({
+                'id': str(uuid.uuid4()), 'date': full_date, 'description': description,
+                'amount': amount, 'direction': direction, 'month': month_field,
+            })
+
+    doc.close()
+    credits = sum(1 for t in transactions if t['direction'] == 'credit')
+    debits  = sum(1 for t in transactions if t['direction'] == 'debit')
+    print(f"[INFO] {filename}: TD columnar extraction — {len(transactions)} transactions "
+          f"({credits} credits / {debits} debits)")
+    return transactions
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1b — Line-based extractor (BMO, Scotia, Affinity)
+# These banks tag amounts unambiguously enough (or show a balance after every
+# single transaction) that a straight text-line pass with balance-delta
+# direction detection works without needing word coordinates.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_line_based(pdf_bytes: bytes, filename: str) -> list[dict]:
     """
     Pure Python extraction from a bank statement PDF.
 
@@ -297,6 +742,7 @@ def extract_transactions_from_pdf(pdf_bytes: bytes, filename: str) -> list[dict]
                 line = line.strip()
                 if line and not _should_discard(line):
                     all_lines.append(line)
+            all_lines.append(_PAGE_BREAK)
         doc.close()
     except Exception as e:
         print(f"[WARN] fitz error for {filename}: {e}")
@@ -316,30 +762,68 @@ def extract_transactions_from_pdf(pdf_bytes: bytes, filename: str) -> list[dict]
 
     print(f"[INFO] {filename}: year={year}, {len(all_lines)} lines after filtering")
 
-    # Group lines into blocks — each block starts with a date line.
-    # Stop collecting when a section-terminator line is encountered
-    # (e.g. "my cheques", "my loans") to avoid double-counting.
+    # Group lines into blocks — each block starts with a date line and closes
+    # either at the next date line, OR once it has its amount+balance pair —
+    # defined as 2 consecutive amount-shaped lines NOT immediately followed
+    # by a 3rd (which would signal an anomalous row like a loan schedule's
+    # Advances/Payments/Principal/Interest/Balance columns — in that case we
+    # deliberately keep absorbing so the ">2 amounts" safety net below can
+    # still catch and discard it, instead of quietly closing early on the
+    # wrong 2 numbers).
+    # Without a closing condition at all, the FINAL block in a file (or a
+    # page, if no stop-section fires) never sees a "next" date line to close
+    # it, so it silently absorbs every remaining line — including footer
+    # legal text — into that one transaction's description, with whichever
+    # numbers happen to appear last in the document becoming its "amount"
+    # and "balance". This is a real bug we found live: a BMO statement's
+    # actual final transaction (its own closing-totals row) swallowed the
+    # entire multi-paragraph legal disclaimer beneath it.
+    lines = [l for l in all_lines]
     blocks = []
     current: list[str] = []
-    stopped = False
-    for line in all_lines:
-        if line.lower() in STOP_SECTIONS:
-            stopped = True
+    block_closed = False
+    stopped_this_page = False
+    n = len(lines)
+    for i, line in enumerate(lines):
+        if line == _PAGE_BREAK:
+            stopped_this_page = False
             if current:
                 blocks.append(current)
                 current = []
-            break
-        if DATE_RE.match(line):
+                block_closed = False
+            continue
+        if stopped_this_page:
+            continue
+        if line.lower() in STOP_SECTIONS:
+            stopped_this_page = True
             if current:
                 blocks.append(current)
-            current = [line]
-        elif current:
+                current = []
+                block_closed = False
+            continue
+        m = DATE_RE.match(line)
+        if m:
+            if current:
+                blocks.append(current)
+            date_str = m.group(0)
+            remainder = line[m.end():].strip()
+            current = [date_str] + ([remainder] if remainder else [])
+            block_closed = False
+            continue
+        if block_closed:
+            continue
+        if current:
             current.append(line)
-    if current and not stopped:
+            if len(current) >= 2 and AMOUNT_RE.match(line) and AMOUNT_RE.match(current[-2]):
+                next_line = lines[i + 1] if i + 1 < n else ''
+                if not AMOUNT_RE.match(next_line):
+                    block_closed = True
+                # else: a 3rd amount immediately follows — anomalous row,
+                # keep absorbing so the discard check below still sees it.
+    if current:
         blocks.append(current)
 
-    print(f"[INFO] {filename}: {len(blocks)} date-prefixed blocks found"
-          + (" (stopped at section terminator)" if stopped else ""))
+    print(f"[INFO] {filename}: {len(blocks)} date-prefixed blocks found")
 
     transactions = []
     prev_balance: float | None = None
@@ -347,6 +831,20 @@ def extract_transactions_from_pdf(pdf_bytes: bytes, filename: str) -> list[dict]
     for block in blocks:
         date_line = block[0]
         rest      = block[1:]
+
+        # Safety net: a normal transaction line has exactly 2 amount-shaped tokens
+        # (amount + balance). Some statements (e.g. Affinity's loan schedule,
+        # with Advances/Payments/Principal/Interest/Balance columns) produce
+        # blocks with 3+ amount-shaped tokens. Rather than silently guessing
+        # which 2 are "the" amount and balance — which previously fed wrong
+        # numbers into income/expense totals — we discard the whole block and
+        # log it, since it isn't a regular transaction row we know how to read.
+        amount_like_count = sum(1 for item in rest if AMOUNT_RE.match(item))
+        if amount_like_count > 2:
+            print(f"[WARN] {filename}: skipping unparseable block with "
+                  f"{amount_like_count} amount-like tokens (likely a loan "
+                  f"schedule or non-standard row): {' '.join(block)[:100]}")
+            continue
 
         # Pull trailing numbers off the end: second-to-last = amount, last = balance
         trailing: list[str] = []
