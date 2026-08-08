@@ -442,7 +442,21 @@ async def _call_claude_document(content: list[dict], filename: str, label: str):
             )
         try:
             response = await asyncio.to_thread(_call)
-            text = response.content[0].text.strip()
+            # response.content[0] isn't always the text block -- a
+            # ThinkingBlock (or any other non-text block) can come first.
+            # Grabbing index [0] blindly crashes with
+            # "'ThinkingBlock' object has no attribute 'text'" on an
+            # otherwise-successful, already-billed API call, wasting it.
+            # Collect every text block instead (there is normally exactly
+            # one) and ignore non-text blocks.
+            text_blocks = [
+                block.text for block in response.content
+                if getattr(block, "type", None) == "text"
+            ]
+            if not text_blocks:
+                block_types = [getattr(b, "type", type(b).__name__) for b in response.content]
+                raise ValueError(f"No text block in Claude's response (got: {block_types})")
+            text = "".join(text_blocks).strip()
             return text, response.stop_reason
         except Exception as e:
             last_err = e
