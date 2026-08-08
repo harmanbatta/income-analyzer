@@ -950,7 +950,7 @@ HTML = """<!DOCTYPE html>
               '<div style="max-width:1200px;margin:0 auto">' +
                 '<div style="font-size:13px;font-weight:700;color:#c0392b;margin-bottom:6px">' +
                   '⚠️ ' + (state.progressInfo.reconciliation_issues||[]).length + ' reconciliation issue(s) — ' +
-                  'extracted totals don\'t match the statement\'s own printed numbers. Verify before relying on this report.' +
+                  'extracted totals don\\'t match the statement\\'s own printed numbers. Verify before relying on this report.' +
                 '</div>' +
                 '<ul style="margin:0;padding-left:18px;font-size:11px;color:#8a2f24">' +
                   (state.progressInfo.reconciliation_issues||[]).slice(0,8).map(function(i){ return '<li>'+h(i)+'</li>'; }).join('') +
