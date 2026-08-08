@@ -112,6 +112,74 @@ def extract_json_transactions(text: str) -> list:
     raise ValueError(f"Could not parse JSON from response. Length={len(text)}")
 
 
+def extract_json_full(text: str) -> dict:
+    """
+    Parses Claude's response into {"statement_periods": [...], "transactions": [...]}.
+    Tolerant of markdown fences, a bare transactions array (schema fallback),
+    and a truncated response: statement_periods is short and emitted first in
+    the schema, so it's recoverable even if the transactions array got cut off
+    mid-way through a long/dense statement.
+    """
+    text = re.sub(r"^```[a-z]*\n?", "", text.strip(), flags=re.MULTILINE)
+    text = re.sub(r"\n?```$", "", text.strip(), flags=re.MULTILINE)
+    text = text.strip()
+
+    try:
+        result = json.loads(text)
+        if isinstance(result, dict):
+            return {
+                "statement_periods": result.get("statement_periods", []),
+                "transactions":      result.get("transactions", []),
+            }
+        if isinstance(result, list):
+            return {"statement_periods": [], "transactions": result}
+    except json.JSONDecodeError:
+        pass
+
+    statement_periods: list = []
+    transactions: list = []
+
+    sp_match = re.search(r'"statement_periods"\s*:\s*\[', text)
+    if sp_match:
+        sp_arr_start = sp_match.end() - 1
+        _, sp_arr_end = extract_balanced(text, "[", "]", sp_arr_start)
+        if sp_arr_end != -1:
+            try:
+                statement_periods = json.loads(text[sp_arr_start: sp_arr_end + 1])
+            except json.JSONDecodeError:
+                pass
+
+    tx_match = re.search(r'"transactions"\s*:\s*\[', text)
+    if tx_match:
+        tx_arr_start = tx_match.end() - 1
+        _, tx_arr_end = extract_balanced(text, "[", "]", tx_arr_start)
+        if tx_arr_end != -1:
+            try:
+                transactions = json.loads(text[tx_arr_start: tx_arr_end + 1])
+            except json.JSONDecodeError:
+                pass
+        if not transactions:
+            # Likely truncated mid-array (hit max_tokens) — salvage whatever
+            # complete transaction objects exist before the cutoff.
+            partial = text[tx_arr_start:]
+            last_complete = max(partial.rfind("},"), partial.rfind("}\n"))
+            if last_complete != -1:
+                partial = partial[: last_complete + 1] + "]"
+                try:
+                    transactions = json.loads(partial)
+                except json.JSONDecodeError:
+                    pass
+
+    if not transactions and not statement_periods:
+        # No object structure found at all — fall back to bare-array handling
+        try:
+            transactions = extract_json_transactions(text)
+        except ValueError:
+            raise ValueError(f"Could not parse JSON from response. Length={len(text)}")
+
+    return {"statement_periods": statement_periods, "transactions": transactions}
+
+
 def deduplicate_categories(transactions: list) -> list:
     """Post-processing: normalize inconsistent category/include for same description+type."""
     key_cats: dict = {}
@@ -132,904 +200,145 @@ def deduplicate_categories(transactions: list) -> list:
     return transactions
 
 
+def reconcile_statement(statement_periods: list, transactions: list) -> tuple[bool, list[str]]:
+    """
+    Cross-checks extracted transactions against the numbers the bank itself
+    printed on the statement (opening/closing balance, total deposits, total
+    withdrawals) — the same manual check that caught the original CIBC bug,
+    now automatic. This is deterministic arithmetic, not another model call
+    trusting a model: either the numbers match to the cent, or they don't.
+
+    Two independent things get checked per statement period:
+      1. Extracted transaction sums vs the statement's own printed totals
+         (catches under/over-extraction).
+      2. The statement's own printed numbers balancing against each other
+         (opening + deposits - withdrawals == closing) — catches Claude
+         misreading its own summary block, independent of transactions.
+
+    Returns (ok, issues) — ok is False if anything is off by more than a cent.
+    """
+    TOLERANCE = 0.01
+    issues: list[str] = []
+
+    by_month: dict[str, dict] = {}
+    for tx in transactions:
+        m = tx.get("month", "")
+        bucket = by_month.setdefault(m, {"deposits": 0.0, "withdrawals": 0.0})
+        if tx.get("type") == "income":
+            bucket["deposits"] += abs(tx.get("amount", 0))
+        else:
+            bucket["withdrawals"] += abs(tx.get("amount", 0))
+
+    for period in statement_periods:
+        label = period.get("period_label", "")
+        expected_dep = period.get("total_deposits")
+        expected_wd  = period.get("total_withdrawals")
+        ob, cb       = period.get("opening_balance"), period.get("closing_balance")
+        actual       = by_month.get(label, {"deposits": 0.0, "withdrawals": 0.0})
+
+        if expected_dep is not None:
+            try:
+                if abs(actual["deposits"] - float(expected_dep)) > TOLERANCE:
+                    issues.append(
+                        f"{label or 'unknown period'}: extracted deposits "
+                        f"${actual['deposits']:.2f} vs statement's printed total "
+                        f"${float(expected_dep):.2f}"
+                    )
+            except (TypeError, ValueError):
+                pass
+
+        if expected_wd is not None:
+            try:
+                if abs(actual["withdrawals"] - float(expected_wd)) > TOLERANCE:
+                    issues.append(
+                        f"{label or 'unknown period'}: extracted withdrawals "
+                        f"${actual['withdrawals']:.2f} vs statement's printed total "
+                        f"${float(expected_wd):.2f}"
+                    )
+            except (TypeError, ValueError):
+                pass
+
+        if None not in (ob, cb, expected_dep, expected_wd):
+            try:
+                implied_close = float(ob) + float(expected_dep) - float(expected_wd)
+                if abs(implied_close - float(cb)) > TOLERANCE:
+                    issues.append(
+                        f"{label or 'unknown period'}: statement's own printed "
+                        f"numbers don't balance (opening ${float(ob):.2f} + deposits "
+                        f"${float(expected_dep):.2f} - withdrawals ${float(expected_wd):.2f} "
+                        f"= ${implied_close:.2f}, not the printed closing ${float(cb):.2f}) "
+                        f"— may have been misread from the PDF"
+                    )
+            except (TypeError, ValueError):
+                pass
+
+    if not statement_periods:
+        issues.append(
+            "No statement summary (opening/closing balance, totals) was found on this "
+            "file — could not automatically verify extraction against the bank's own numbers."
+        )
+
+    return (len(issues) == 0), issues
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 1 — Python PDF parser (no AI, deterministic)
-# Works for BMO and most Canadian bank statements with month-day date format.
+# Extraction: every uploaded PDF is sent directly to Claude as a native
+# document (see _extract_via_document below). No bank-specific parsers.
+#
+# Earlier versions of this app had separate hand-built extractors per bank
+# (RBC/TD column-position readers, a BMO/Scotia/Affinity line-based regex
+# parser). Those were removed: a parser tuned for one bank's layout can
+# silently under-extract on any bank it wasn't tested against — that's
+# exactly what happened with a CIBC statement, which returned a partial,
+# non-empty transaction list that never triggered a fallback. Sending the
+# real PDF to Claude for every file removes that failure mode entirely,
+# at a cost of well under $1 per statement — cheap enough that maintaining
+# per-bank regex isn't worth the risk.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Date patterns — handles multiple Canadian bank formats:
-#   BMO / Scotia:  "Apr 01"      (month abbr + day, no year)
-#   Affinity:      "3 Mar 2025"  (day + month abbr + 4-digit year)
-DATE_RE = re.compile(
-    r'^(?:'
-    r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}'           # BMO/Scotia
-    r'|\d{1,2}\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}'  # Affinity
-    r')\b'   # prefix match only (not full-line) — Affinity sometimes prints the
-             # date and the first word of the description on the same line with
-             # no line break, e.g. "11 Aug 2025 ROYAL BANK CENTRAL CARD CENTRE"
-    , re.I
-)
-# Page-boundary marker inserted between pages so STOP_SECTIONS only ever
-# truncates the CURRENT page/statement, never every remaining page in a
-# multi-month merged PDF.
-_PAGE_BREAK = '\x00PAGE_BREAK\x00'
-AMOUNT_RE = re.compile(r'^\$?-?[\d,]+\.\d{2}$')   # optional $ prefix (Affinity)
-PERIOD_RE = re.compile(r'for the period ending\s+\S+\s+\d{1,2},?\s+(\d{4})', re.I)
-YEAR_RE   = re.compile(r'\b(20\d{2})\b')
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF extraction — Claude reads the document directly
+# The actual PDF bytes are sent to Claude as a native document: full text
+# fidelity, no OCR/rasterization step, no bank-specific parser to maintain.
+# Combines extraction + categorisation in one call per page-chunk.
+# ─────────────────────────────────────────────────────────────────────────────
 
-MONTH_TO_NUM = {
-    'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
-    'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
-    'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12',
-}
-NUM_TO_MONTH = {v: k.capitalize() for k, v in MONTH_TO_NUM.items()}
+DOCUMENT_EXTRACT_PROMPT = """You are a mortgage underwriting analyst reading a bank statement PDF.
+Read the actual document directly — do not skim or summarise, extract every line.
 
-# When any of these lines appear, stop collecting transactions (non-transaction sections)
-STOP_SECTIONS = {
-    'my cheques', 'my loans', '~ end of statement ~',
-    'end of statement', 'loan summary:', 'my cheques & savings account',
-    # NOTE: the generic word 'total' used to be in this set, but it is too
-    # fragile — e.g. BMO's own account summary table prints "Total" (as two
-    # separate column-header cells) before the real transaction listing even
-    # starts, which silently killed the first several days of every BMO
-    # statement. A stray "Total" subtotal row no longer needs a stop-word:
-    # once a block has its amount+balance pair it self-closes (see the block
-    # builder below), so trailing junk like "Total\n$0.13" after an already
-    # closed block is automatically ignored rather than merged in.
-}
+Return ONE JSON object with two top-level keys: "statement_periods" and "transactions".
+Return ONLY that JSON object. No prose, no markdown.
 
-# Lines to always discard (matched against lowercased content)
-DISCARD_EXACT = {
-    # BMO
-    'transaction details', 'transaction details (continued)',
-    'amounts debited', 'amounts credited',
-    'from your account ($)', 'to your account ($)', 'balance ($)',
-    '(continued)', 'continued',
-    'business banking statement', 'business banking',
-    'summary of account', 'number of items processed',
-    'your branch address:', 'your branch', 'your plan',
-    'direct banking', 'www.bmo.com',
-    'essential plan $0 monthly fee',
-    'for questions about your', 'statement call',
-    'debited ($)', 'credited ($)', 'balance ($) on',
-    # Scotia
-    'your preferred package account summary',
-    'minus total withdrawals', 'plus total deposits',
-    "here's what happened in your account this statement period",
-    'amounts', 'transactions', 'withdrawn ($)', 'deposited ($)',
-    'call 1 800 4-scotia', 'for online account access:',
-    'your account number:', 'questions?',
-    # Affinity
-    'my chequing & savings account', 'statement of accounts',
-    'statement reconciliation', 'credit union deposit insurance',
-    'bill payments', 'continued...', 'my account summary',
-    'deposits \u2013 cdn', 'deposits \u2013 usd', 'loans',
-    'withdrawals', 'deposits', 'balance',
-    'business select chequing sub number 001',
-    'business savings sub number 001',
-    'advances', 'payments', 'principal',
-    # NOTE: 'interest' intentionally NOT in this set — it's also a legitimate
-    # transaction description (e.g. monthly interest credited on a savings
-    # account). The loan-schedule table it's meant to filter is instead
-    # caught structurally by the "more than 2 amount tokens" safety net below.
-    'current interest rate', 'interest paid current year',
-    # General
-    'date', 'description', 'opening', 'closing', 'account',
-    '-', '+', '=', '|',
-}
+═══ statement_periods (fill this in FIRST, before transactions) ═══
+Every bank statement prints its own account summary — usually near the top —
+showing opening balance, closing balance, total deposits, and total
+withdrawals for that statement's period. If this PDF contains multiple
+monthly statements (e.g. a full year), return one entry per calendar month.
+Read these numbers EXACTLY as printed — do not calculate or estimate them,
+they are stated directly on the document.
 
-DISCARD_PATTERNS = [
-    re.compile(r'^page \d+ of \d+$', re.I),           # "Page 1 of 17"
-    re.compile(r'^\.*$'),                               # blank or all-dots
-    re.compile(r'^\.{2,}'),                             # lines starting with dots
-    re.compile(r'^-{3,}$'),                             # separator lines
-    re.compile(r'^\d+$'),                               # bare integers (e.g. item counts 76, 516)
-    re.compile(r'^business account\b', re.I),           # "Business Account # ..."
-    re.compile(r'^business name:', re.I),
-    re.compile(r'^#\s*\d'),                             # "# 3050 1981-377"
-    re.compile(r'^transit number:', re.I),
-    re.compile(r'^\(\d{3}\)\s*\d{3}'),                 # phone numbers
-    re.compile(r'^1-\d{3}-\d{3}-\d{4}$'),              # 1-800 numbers
-    re.compile(r'^www\.', re.I),                        # URLs
-    re.compile(r'^[a-z]\d[a-z]\s*\d[a-z]\d$', re.I),  # Canadian postal codes like L6R3P4
-    re.compile(r'^\d{5}\s+[A-Z]{2}'),                  # US-style zip + state
-    re.compile(r'^for the period ending', re.I),        # period header line
+[
+  {
+    "period_label": "Mon-YY, e.g. Jul-25, matching the format used in transactions[].month",
+    "opening_balance": 15616.65,
+    "closing_balance": 8847.56,
+    "total_deposits": 74909.85,
+    "total_withdrawals": 81678.94
+  }
 ]
-
-# Date-prefixed lines that are NOT real transactions
-NON_TX_DESCRIPTIONS = {
-    'opening balance', 'closing totals', 'closing balance', 'balance forward',
-}
-
-
-def _should_discard(line: str) -> bool:
-    low = line.lower()
-    if low in DISCARD_EXACT:
-        return True
-    return any(p.match(low) for p in DISCARD_PATTERNS)
-
-
-def _parse_amount(s: str) -> float:
-    return float(s.replace(',', '').replace('$', ''))
-
-
-def _extract_account_holder(pdf_bytes: bytes) -> str:
-    """
-    Pull the account holder / business name from the first page of any PDF.
-    Used to detect internal same-name e-transfers (savings ↔ chequing).
-    Returns empty string if not found.
-    """
-    try:
-        doc  = fitz.open(stream=pdf_bytes, filetype='pdf')
-        text = doc[0].get_text() if len(doc) > 0 else ""
-        doc.close()
-    except Exception:
-        return ""
-
-    # BMO: "Business name:\n<NAME>"
-    m = re.search(r'Business name:\s*\n?\s*([A-Z][A-Z0-9 &.,\'-]{3,})', text, re.I)
-    if m:
-        return m.group(1).strip()
-
-    # Affinity / generic: "Account Number XXXX - <NAME>"
-    m = re.search(r'Account Number\s+\S+\s*[-–]\s*(.+?)(?:\n|$)', text, re.I)
-    if m:
-        return m.group(1).strip()
-
-    # Scotia / RBC style: bold name block near top (all-caps 2+ words)
-    m = re.search(r'^([A-Z]{2,}(?:\s+[A-Z]{2,}){1,5})\s*$', text, re.M)
-    if m:
-        candidate = m.group(1).strip()
-        # Skip obvious non-names
-        skip = {'ACCOUNT STATEMENT', 'TRANSACTION DETAILS', 'ROYAL BANK', 'TD CANADA TRUST',
-                'CIBC', 'SCOTIABANK', 'BMO', 'AFFINITY', 'WEALTHSIMPLE', 'BALANCE FORWARD'}
-        if candidate not in skip and len(candidate) > 5:
-            return candidate
-
-    return ""
-
-
-def _detect_bank(pdf_bytes: bytes) -> str:
-    """Sniff the bank from the first page of text. Returns 'rbc', 'td', or 'other'
-    (BMO/Scotia/Affinity/anything else all use the line-based extractor)."""
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
-        text = doc[0].get_text() if len(doc) > 0 else ""
-        doc.close()
-    except Exception:
-        return "other"
-    low = text.lower()
-    if 'royal bank of canada' in low or 'rbbda' in low:
-        return 'rbc'
-    if 'td canada trust' in low or 'tdcda' in low or 'toronto-dominion' in low or 'easyweb' in low:
-        return 'td'
-    return 'other'
-
-
-def extract_transactions_from_pdf(pdf_bytes: bytes, filename: str) -> list[dict]:
-    """
-    Top-level dispatcher. RBC and TD statements don't print a debit/credit tag
-    on each line and frequently show multiple transactions per date with only
-    one running balance — text alone can't disambiguate direction, so they use
-    a column-position extractor (reads word bounding boxes to see which column
-    an amount sits under). Every other bank (BMO, Scotia, Affinity) uses the
-    original line-based, balance-delta extractor.
-    """
-    bank = _detect_bank(pdf_bytes)
-    if bank == 'rbc':
-        return _extract_rbc_columnar(pdf_bytes, filename)
-    if bank == 'td':
-        return _extract_td_columnar(pdf_bytes, filename)
-    return _extract_line_based(pdf_bytes, filename)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 1a — Column-position extractors (RBC, TD)
-# These banks print two separate amount columns (debit/credit) with no tag on
-# the number itself, and often show several transactions under one date with
-# only the LAST one carrying a running balance. Line-order regex can't safely
-# resolve that, so instead we read each word's x-position via PyMuPDF's word
-# bounding boxes and bucket every amount by which column header it sits under.
-# Rows are reconstructed by clustering words with the same y-coordinate.
-# ─────────────────────────────────────────────────────────────────────────────
-
-_MONTH_TO_NUM = MONTH_TO_NUM
-AMOUNT_TOKEN_RE = re.compile(r'^\$?-?[\d,]+\.\d{2}$')
-RBC_DAY_TOKEN_RE = re.compile(r'^\d{1,2}$')
-RBC_MON_TOKEN_RE = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$', re.I)
-TD_DATE_TOKEN_RE = re.compile(r'^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})$', re.I)
-TD_EASYWEB_DATE_RE = re.compile(
-    r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),\s+(\d{4})$', re.I
-)
-COLUMNAR_NON_TX_PREFIXES = (
-    'opening balance', 'closing balance', 'closing totals', 'balance forward',
-    'account fees', 'total',
-)
-
-
-def _group_rows(words: list, y_tol: float = 2.5) -> list[list]:
-    """Cluster PyMuPDF word tuples into visual table rows by y-coordinate."""
-    words = sorted(words, key=lambda w: (w[1], w[0]))
-    rows, current, current_y = [], [], None
-    for w in words:
-        if current_y is None or abs(w[1] - current_y) <= y_tol:
-            current.append(w)
-            current_y = w[1] if current_y is None else min(current_y, w[1])
-        else:
-            rows.append(sorted(current, key=lambda x: x[0]))
-            current, current_y = [w], w[1]
-    if current:
-        rows.append(sorted(current, key=lambda x: x[0]))
-    return rows
-
-
-def _rbc_period(text: str):
-    m = re.search(
-        r'([A-Z][a-z]+)\s+\d{1,2},\s+(\d{4})\s+to\s+([A-Z][a-z]+)\s+\d{1,2},\s+(\d{4})', text
-    )
-    if m:
-        return m.group(1)[:3], int(m.group(2)), m.group(3)[:3], int(m.group(4))
-    return None
-
-
-def _extract_rbc_columnar(pdf_bytes: bytes, filename: str) -> list[dict]:
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
-    except Exception as e:
-        print(f"[WARN] fitz error for {filename}: {e}")
-        return []
-
-    transactions: list[dict] = []
-    last_period = None
-    skipped_image_pages: list[int] = []
-
-    for pno, page in enumerate(doc, 1):
-        text = page.get_text()
-        if not text.strip():
-            skipped_image_pages.append(pno)
-            continue
-
-        period = _rbc_period(text)
-        if period:
-            last_period = period
-        start_mon, start_year, end_mon, end_year = last_period or (
-            None, datetime.now().year, None, datetime.now().year
-        )
-
-        words = page.get_text("words")
-        cheques_hits = [w for w in words if w[4] == 'Cheques']
-        if not cheques_hits:
-            print(f"[WARN] {filename} p{pno}: RBC column header not found, skipping page")
-            continue
-        header_y0 = cheques_hits[0][1]
-        same_row = sorted([w for w in words if abs(w[1] - header_y0) <= 2.5], key=lambda w: w[0])
-        hdr = {}
-        paren_hits = [w for w in same_row if w[4] == '($)']
-        if len(paren_hits) >= 3:
-            # The 3 "($)" suffixes on this row, left to right, belong to
-            # Cheques & Debits ($) / Deposits & Credits ($) / Balance ($).
-            hdr['debit'], hdr['credit'], hdr['balance'] = (
-                paren_hits[0][2], paren_hits[1][2], paren_hits[2][2]
-            )
-        for w in same_row:
-            if w[4] == 'Date' and 'date' not in hdr: hdr['date'] = w[2]
-            if w[4] == 'Description' and 'desc' not in hdr: hdr['desc'] = w[2]
-        if len(hdr) < 5:
-            print(f"[WARN] {filename} p{pno}: RBC column header incomplete, skipping page")
-            continue
-
-        debit_credit_mid = (hdr['debit'] + hdr['credit']) / 2
-        credit_balance_mid = (hdr['credit'] + hdr['balance']) / 2
-        # Anchor to the header ROW's own y (header_y0), not a page-wide max of
-        # matching words — a generic word like "Balance" or "Date" can appear
-        # again much further down the page (e.g. in footer text), which would
-        # push this cutoff past the real transaction rows and silently return
-        # zero transactions. This exact bug hit TD's mailed-statement layout:
-        # "NEXT STATEMENT DATE IS AUG 29/25" in the footer contains "DATE".
-        rows = _group_rows([w for w in words if w[1] > header_y0 + 5])
-
-        current_date = None
-        desc_buffer: list[str] = []
-
-        for row in rows:
-            toks = list(row)
-            # Strip leading date tokens. Normally this is a single "29 Jul"
-            # pair, but a row that's the first line on a NEW page repeats the
-            # date as "29 29 Jul Jul" (PyMuPDF duplicates it from a rendering
-            # artifact where the date is drawn once but spans two internal
-            # text runs) — so scan for a leading run of day/month tokens in
-            # ANY order/count rather than assuming a strict alternating pair,
-            # and take whichever day/month values were found.
-            j = 0
-            day_val = mon_val = None
-            while j < len(toks):
-                t = toks[j][4]
-                if RBC_DAY_TOKEN_RE.match(t):
-                    day_val = t.zfill(2)
-                    j += 1
-                elif RBC_MON_TOKEN_RE.match(t):
-                    mon_val = t.capitalize()
-                    j += 1
-                else:
-                    break
-            if day_val and mon_val:
-                current_date = (day_val, mon_val)
-                toks = toks[j:]
-
-            debit_amt = credit_amt = None
-            desc_words = []
-            for w in toks:
-                x1, text_val = w[2], w[4]
-                if AMOUNT_TOKEN_RE.match(text_val):
-                    if x1 < debit_credit_mid:
-                        debit_amt = text_val
-                    elif x1 < credit_balance_mid:
-                        credit_amt = text_val
-                    # else: balance column — informational only, not needed for direction
-                else:
-                    desc_words.append(text_val)
-
-            joined_new = ' '.join(desc_words).strip().lower()
-            if any(joined_new.startswith(p) for p in COLUMNAR_NON_TX_PREFIXES):
-                desc_buffer = []
-                continue
-
-            desc_buffer.extend(desc_words)
-
-            if debit_amt or credit_amt:
-                description = ' '.join(desc_buffer).strip()
-                desc_buffer = []
-                if not current_date or description.lower() in NON_TX_DESCRIPTIONS:
-                    continue
-                day, mon_abbr = current_date
-                mon_num = _MONTH_TO_NUM[mon_abbr.lower()]
-                if start_mon and mon_abbr.lower().startswith(start_mon.lower()):
-                    tx_year = start_year
-                elif end_mon and mon_abbr.lower().startswith(end_mon.lower()):
-                    tx_year = end_year
-                else:
-                    tx_year = end_year
-                full_date = f"{tx_year}-{mon_num}-{day}"
-                month_field = f"{mon_abbr}-{str(tx_year)[2:]}"
-
-                if debit_amt:
-                    amount, direction = _parse_amount(debit_amt), 'debit'
-                else:
-                    amount, direction = _parse_amount(credit_amt), 'credit'
-
-                transactions.append({
-                    'id': str(uuid.uuid4()), 'date': full_date, 'description': description,
-                    'amount': amount, 'direction': direction, 'month': month_field,
-                })
-
-    doc.close()
-
-    if skipped_image_pages:
-        print(f"[WARN] {filename}: {len(skipped_image_pages)} page(s) with no extractable "
-              f"text skipped (pages {skipped_image_pages[0]}-{skipped_image_pages[-1]}) — "
-              f"these are scanned/image pages; ask for a fresh direct download, or split "
-              f"them into a separate file so they hit the vision fallback")
-
-    credits = sum(1 for t in transactions if t['direction'] == 'credit')
-    debits  = sum(1 for t in transactions if t['direction'] == 'debit')
-    print(f"[INFO] {filename}: RBC columnar extraction — {len(transactions)} transactions "
-          f"({credits} credits / {debits} debits)")
-    return transactions
-
-
-def _td_period(text: str):
-    m = re.search(r'([A-Z]{3})\s+(\d{1,2})/(\d{2})\s*-\s*([A-Z]{3})\s+(\d{1,2})/(\d{2})', text)
-    if m:
-        return m.group(1), 2000 + int(m.group(3)), m.group(4), 2000 + int(m.group(6))
-    return None
-
-
-def _extract_td_easyweb_page(words: list, filename: str, pno: int) -> Optional[list[dict]]:
-    """TD's EasyWeb online-banking export: Date | Description | Withdrawals | Deposits |
-    Balance, with full 'Jun 30, 2026' dates (own year, no statement-header lookup needed)."""
-    withdrawals = [w for w in words if w[4] == 'Withdrawals']
-    if not withdrawals:
-        return None
-    header_y0 = withdrawals[0][1]
-    same_row = [w for w in words if abs(w[1] - header_y0) <= 2.5]
-    hdr = {}
-    for w in same_row:
-        # Use right edge (x1) — see comment in _extract_rbc_columnar for why
-        # left-edge bucketing misclassifies short amounts near a boundary.
-        if w[4] == 'Date' and 'date' not in hdr: hdr['date'] = w[2]
-        if w[4] == 'Withdrawals' and 'debit' not in hdr: hdr['debit'] = w[2]
-        if w[4] == 'Deposits' and 'credit' not in hdr: hdr['credit'] = w[2]
-        if w[4] == 'Balance' and 'balance' not in hdr: hdr['balance'] = w[2]
-    if len(hdr) < 4:
-        return None
-
-    debit_credit_mid = (hdr['debit'] + hdr['credit']) / 2
-    credit_balance_mid = (hdr['credit'] + hdr['balance']) / 2
-    # Anchor to the header row's own y (header_y0), not a page-wide max —
-    # see comment in _extract_rbc_columnar for why that's unsafe.
-    rows = _group_rows([w for w in words if w[1] > header_y0 + 5])
-
-    transactions: list[dict] = []
-    current_date = None
-    desc_buffer: list[str] = []
-
-    for row in rows:
-        toks = list(row)
-        joined = ' '.join(t[4] for t in toks[:3])
-        m = TD_EASYWEB_DATE_RE.match(joined)
-        if m:
-            current_date = (m.group(1).capitalize(), m.group(2).zfill(2), m.group(3))
-            toks = toks[3:]
-
-        debit_amt = credit_amt = None
-        desc_words = []
-        for w in toks:
-            x1, text_val = w[2], w[4]
-            if AMOUNT_TOKEN_RE.match(text_val):
-                if x1 < debit_credit_mid:
-                    debit_amt = text_val
-                elif x1 < credit_balance_mid:
-                    credit_amt = text_val
-            else:
-                desc_words.append(text_val)
-
-        joined_new = ' '.join(desc_words).strip().lower()
-        if any(joined_new.startswith(p) for p in COLUMNAR_NON_TX_PREFIXES):
-            desc_buffer = []
-            continue
-
-        desc_buffer.extend(desc_words)
-
-        if debit_amt or credit_amt:
-            description = ' '.join(desc_buffer).strip()
-            desc_buffer = []
-            if not current_date or description.lower() in NON_TX_DESCRIPTIONS:
-                continue
-            mon_abbr, day, year = current_date
-            mon_num = _MONTH_TO_NUM[mon_abbr.lower()]
-            full_date = f"{year}-{mon_num}-{day}"
-            month_field = f"{mon_abbr}-{year[2:]}"
-            if debit_amt:
-                amount, direction = _parse_amount(debit_amt), 'debit'
-            else:
-                amount, direction = _parse_amount(credit_amt), 'credit'
-            transactions.append({
-                'id': str(uuid.uuid4()), 'date': full_date, 'description': description,
-                'amount': amount, 'direction': direction, 'month': month_field,
-            })
-
-    print(f"[INFO] {filename} p{pno}: TD EasyWeb layout detected — {len(transactions)} transactions")
-    return transactions
-
-
-def _extract_td_columnar(pdf_bytes: bytes, filename: str) -> list[dict]:
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
-    except Exception as e:
-        print(f"[WARN] fitz error for {filename}: {e}")
-        return []
-
-    transactions: list[dict] = []
-
-    for pno, page in enumerate(doc, 1):
-        text = page.get_text()
-        if not text.strip():
-            continue
-
-        period = _td_period(text)
-        start_mon, start_year, end_mon, end_year = period or (
-            None, datetime.now().year, None, datetime.now().year
-        )
-
-        words = page.get_text("words")
-        debit_hits = [w for w in words if w[4].upper() == 'CHEQUE/DEBIT']
-        hdr = {}
-        if debit_hits:
-            header_y0 = debit_hits[0][1]
-            same_row = [w for w in words if abs(w[1] - header_y0) <= 2.5]
-            for w in same_row:
-                # Right edge (x1) — see comment in _extract_rbc_columnar.
-                wt = w[4].upper()
-                if wt == 'DESCRIPTION' and 'desc' not in hdr: hdr['desc'] = w[2]
-                if wt == 'CHEQUE/DEBIT' and 'debit' not in hdr: hdr['debit'] = w[2]
-                if wt == 'DEPOSIT/CREDIT' and 'credit' not in hdr: hdr['credit'] = w[2]
-                if wt == 'DATE' and 'date' not in hdr: hdr['date'] = w[2]
-                if wt == 'BALANCE' and 'balance' not in hdr: hdr['balance'] = w[2]
-
-        if len(hdr) < 5:
-            # Not the mailed-statement layout — try TD's EasyWeb online-banking export
-            easyweb_txs = _extract_td_easyweb_page(words, filename, pno)
-            if easyweb_txs is not None:
-                transactions.extend(easyweb_txs)
-            else:
-                print(f"[WARN] {filename} p{pno}: no recognized TD layout found, skipping page")
-            continue
-
-        debit_credit_mid = (hdr['debit'] + hdr['credit']) / 2
-        credit_date_mid = (hdr['credit'] + hdr['date']) / 2
-        date_balance_mid = (hdr['date'] + hdr['balance']) / 2
-        # Anchor to the header row's own y (header_y0), not a page-wide max —
-        # see comment in _extract_rbc_columnar for why that's unsafe (TD's
-        # own footer text "NEXT STATEMENT DATE IS AUG 29/25" contains "DATE").
-        rows = _group_rows([w for w in words if w[1] > header_y0 + 5])
-
-        for row in rows:
-            debit_amt = credit_amt = None
-            date_tok = None
-            desc_words = []
-            for w in row:
-                x1, text_val = w[2], w[4]
-                if TD_DATE_TOKEN_RE.match(text_val):
-                    date_tok = text_val.upper()
-                    continue
-                if AMOUNT_TOKEN_RE.match(text_val):
-                    if x1 < debit_credit_mid:
-                        debit_amt = text_val
-                    elif x1 < credit_date_mid:
-                        credit_amt = text_val
-                    elif x1 < date_balance_mid:
-                        pass  # stray token in the date gap — ignore
-                    # else: balance column — informational only
-                else:
-                    desc_words.append(text_val)
-
-            description = ' '.join(desc_words).strip()
-            if not (debit_amt or credit_amt):
-                continue
-            if not date_tok or description.lower() in NON_TX_DESCRIPTIONS:
-                continue
-
-            m = TD_DATE_TOKEN_RE.match(date_tok)
-            mon_abbr, day = m.group(1).capitalize(), m.group(2)
-            mon_num = _MONTH_TO_NUM[mon_abbr.lower()]
-            if start_mon and mon_abbr.upper() == start_mon.upper():
-                tx_year = start_year
-            elif end_mon and mon_abbr.upper() == end_mon.upper():
-                tx_year = end_year
-            else:
-                tx_year = end_year
-            full_date = f"{tx_year}-{mon_num}-{day}"
-            month_field = f"{mon_abbr}-{str(tx_year)[2:]}"
-
-            if debit_amt:
-                amount, direction = _parse_amount(debit_amt), 'debit'
-            else:
-                amount, direction = _parse_amount(credit_amt), 'credit'
-
-            transactions.append({
-                'id': str(uuid.uuid4()), 'date': full_date, 'description': description,
-                'amount': amount, 'direction': direction, 'month': month_field,
-            })
-
-    doc.close()
-    credits = sum(1 for t in transactions if t['direction'] == 'credit')
-    debits  = sum(1 for t in transactions if t['direction'] == 'debit')
-    print(f"[INFO] {filename}: TD columnar extraction — {len(transactions)} transactions "
-          f"({credits} credits / {debits} debits)")
-    return transactions
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 1b — Line-based extractor (BMO, Scotia, Affinity)
-# These banks tag amounts unambiguously enough (or show a balance after every
-# single transaction) that a straight text-line pass with balance-delta
-# direction detection works without needing word coordinates.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _extract_line_based(pdf_bytes: bytes, filename: str) -> list[dict]:
-    """
-    Pure Python extraction from a bank statement PDF.
-
-    PyMuPDF linearises the table layout so each field (date, description,
-    continuation lines, amount, balance) appears on its own text line.
-
-    Algorithm:
-      1. Collect all non-garbage lines from every page.
-      2. Group into blocks, each starting with a date line (Mon DD).
-      3. Within each block, the last two numbers are amount + balance.
-         Everything in between is the transaction description.
-      4. Determine credit/debit from balance delta — no guessing from text.
-    """
-    all_lines = []
-    raw_pages = []
-
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
-        for page in doc:
-            page_text = page.get_text()
-            raw_pages.append(page_text)
-            for line in page_text.split('\n'):
-                line = line.strip()
-                if line and not _should_discard(line):
-                    all_lines.append(line)
-            all_lines.append(_PAGE_BREAK)
-        doc.close()
-    except Exception as e:
-        print(f"[WARN] fitz error for {filename}: {e}")
-        return []
-
-    full_text = '\n'.join(raw_pages)
-
-    # Detect statement year from "For the period ending … YYYY"
-    year = datetime.now().year
-    m = PERIOD_RE.search(full_text)
-    if m:
-        year = int(m.group(1))
-    else:
-        found = YEAR_RE.findall(full_text[:800])
-        if found:
-            year = int(found[0])
-
-    print(f"[INFO] {filename}: year={year}, {len(all_lines)} lines after filtering")
-
-    # Group lines into blocks — each block starts with a date line and closes
-    # either at the next date line, OR once it has its amount+balance pair —
-    # defined as 2 consecutive amount-shaped lines NOT immediately followed
-    # by a 3rd (which would signal an anomalous row like a loan schedule's
-    # Advances/Payments/Principal/Interest/Balance columns — in that case we
-    # deliberately keep absorbing so the ">2 amounts" safety net below can
-    # still catch and discard it, instead of quietly closing early on the
-    # wrong 2 numbers).
-    # Without a closing condition at all, the FINAL block in a file (or a
-    # page, if no stop-section fires) never sees a "next" date line to close
-    # it, so it silently absorbs every remaining line — including footer
-    # legal text — into that one transaction's description, with whichever
-    # numbers happen to appear last in the document becoming its "amount"
-    # and "balance". This is a real bug we found live: a BMO statement's
-    # actual final transaction (its own closing-totals row) swallowed the
-    # entire multi-paragraph legal disclaimer beneath it.
-    lines = [l for l in all_lines]
-    blocks = []
-    current: list[str] = []
-    block_closed = False
-    stopped_this_page = False
-    n = len(lines)
-    for i, line in enumerate(lines):
-        if line == _PAGE_BREAK:
-            stopped_this_page = False
-            if current:
-                blocks.append(current)
-                current = []
-                block_closed = False
-            continue
-        if stopped_this_page:
-            continue
-        if line.lower() in STOP_SECTIONS:
-            stopped_this_page = True
-            if current:
-                blocks.append(current)
-                current = []
-                block_closed = False
-            continue
-        m = DATE_RE.match(line)
-        if m:
-            if current:
-                blocks.append(current)
-            date_str = m.group(0)
-            remainder = line[m.end():].strip()
-            current = [date_str] + ([remainder] if remainder else [])
-            block_closed = False
-            continue
-        if block_closed:
-            continue
-        if current:
-            current.append(line)
-            if len(current) >= 2 and AMOUNT_RE.match(line) and AMOUNT_RE.match(current[-2]):
-                next_line = lines[i + 1] if i + 1 < n else ''
-                if not AMOUNT_RE.match(next_line):
-                    block_closed = True
-                # else: a 3rd amount immediately follows — anomalous row,
-                # keep absorbing so the discard check below still sees it.
-    if current:
-        blocks.append(current)
-
-    print(f"[INFO] {filename}: {len(blocks)} date-prefixed blocks found")
-
-    transactions = []
-    prev_balance: float | None = None
-
-    for block in blocks:
-        date_line = block[0]
-        rest      = block[1:]
-
-        # Safety net: a normal transaction line has exactly 2 amount-shaped tokens
-        # (amount + balance). Some statements (e.g. Affinity's loan schedule,
-        # with Advances/Payments/Principal/Interest/Balance columns) produce
-        # blocks with 3+ amount-shaped tokens. Rather than silently guessing
-        # which 2 are "the" amount and balance — which previously fed wrong
-        # numbers into income/expense totals — we discard the whole block and
-        # log it, since it isn't a regular transaction row we know how to read.
-        amount_like_count = sum(1 for item in rest if AMOUNT_RE.match(item))
-        if amount_like_count > 2:
-            print(f"[WARN] {filename}: skipping unparseable block with "
-                  f"{amount_like_count} amount-like tokens (likely a loan "
-                  f"schedule or non-standard row): {' '.join(block)[:100]}")
-            continue
-
-        # Pull trailing numbers off the end: second-to-last = amount, last = balance
-        trailing: list[str] = []
-        desc_parts: list[str] = []
-        for item in reversed(rest):
-            if AMOUNT_RE.match(item) and len(trailing) < 2:
-                trailing.insert(0, item)
-            else:
-                desc_parts.insert(0, item)
-
-        description = ' '.join(desc_parts).strip()
-
-        # Only 1 trailing number → opening balance row (no transaction amount)
-        if len(trailing) < 2:
-            if trailing:
-                try:
-                    prev_balance = _parse_amount(trailing[0])
-                except ValueError:
-                    pass
-            continue
-
-        # Skip known non-transaction date rows
-        if description.lower() in NON_TX_DESCRIPTIONS:
-            continue
-
-        amount_str, balance_str = trailing[0], trailing[1]
-        try:
-            amount  = _parse_amount(amount_str)
-            balance = _parse_amount(balance_str)
-        except ValueError:
-            continue
-
-        # Determine direction from balance delta — 100% accurate, no description guessing
-        direction = 'debit'  # safe default
-        if prev_balance is not None:
-            delta = round(balance - prev_balance, 2)
-            if abs(delta - amount) < 0.02:      # balance went up → credit
-                direction = 'credit'
-            elif abs(delta + amount) < 0.02:    # balance went down → debit
-                direction = 'debit'
-            else:
-                # Delta mismatch — fall back to description keywords
-                dl = description.lower()
-                if any(k in dl for k in ['received', 'direct deposit', 'deposit', 'refund']):
-                    direction = 'credit'
-                elif any(k in dl for k in ['sent', 'purchase', 'payment', 'withdrawal',
-                                            'fee', 'charge', 'draft', 'transfer out']):
-                    direction = 'debit'
-                else:
-                    direction = 'debit'
-
-        # Build date and month strings — handle two formats:
-        #   BMO/Scotia: "Apr 01"      → month=parts[0], day=parts[1], year from statement
-        #   Affinity:   "3 Mar 2025"  → day=parts[0], month=parts[1], year=parts[2]
-        parts = date_line.split()
-        if len(parts) == 3 and parts[2].isdigit() and len(parts[2]) == 4:
-            # Affinity format — year is embedded in the date line itself
-            m_abbr  = parts[1].capitalize()
-            day     = parts[0].zfill(2)
-            tx_year = int(parts[2])          # always correct, even across year boundaries
-        else:
-            # BMO / Scotia format
-            m_abbr  = parts[0].capitalize()
-            day     = parts[1].zfill(2)
-            tx_year = year
-
-        mon_num     = MONTH_TO_NUM.get(m_abbr.lower(), '01')
-        full_date   = f"{tx_year}-{mon_num}-{day}"
-        month_field = f"{m_abbr}-{str(tx_year)[2:]}"   # e.g. "Mar-25"
-
-        transactions.append({
-            'id':          str(uuid.uuid4()),
-            'date':        full_date,
-            'description': description,
-            'amount':      amount,
-            'direction':   direction,
-            'month':       month_field,
-        })
-        prev_balance = balance
-
-    credits = sum(1 for t in transactions if t['direction'] == 'credit')
-    debits  = sum(1 for t in transactions if t['direction'] == 'debit')
-    print(f"[INFO] {filename}: extracted {len(transactions)} transactions "
-          f"({credits} credits / {debits} debits)")
-    return transactions
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 2 — Claude categorisation prompt (categorisation only, no extraction)
-# ─────────────────────────────────────────────────────────────────────────────
-
-CAT_PROMPT = """MORTGAGE UNDERWRITING — TRANSACTION CATEGORISATION
-
-You are a mortgage underwriting analyst. Bank transactions have been pre-extracted by a parser. Your only job is to assign category, suggested_include (Y or N), and reason to each transaction.
-
-CRITICAL: The "direction" field is pre-determined from the bank statement and is always correct.
-  direction "credit" = money coming IN  (income transaction)
-  direction "debit"  = money going OUT  (expense transaction)
-Never override the direction. Never reclassify a debit as income or a credit as expense.
-
-Return ONLY a valid JSON array — no prose, no markdown fences.
-Each element: {"id": "...", "category": "...", "suggested_include": "Y", "reason": "..."}
-Every input transaction must appear in the output with its exact id.
-
-── CATEGORIES ──────────────────────────────────────────────────────────────
-Use the most specific label from the payee name or transfer type.
-Income: INTERAC e-Transfer In, ATM Deposit, Mobile Deposit, Cheque Deposit, Direct Deposit, Wire Transfer, Cash Deposit, Internal Transfer In, NSF Reversal, Government Rebate, Merchant Services Deposit, or exact sender name.
-Expense: exact payee name (e.g. "Enbridge Gas", "CHIT CHATS BC") or transfer type such as INTERAC e-Transfer Out, Cash Withdrawal, Bank Charges, Cheque, CC Transfer, Transfer Out, Canadian Draft, Merchant Services Fee.
-Special: MSP fees / merchant services fees / POS fees / terminal fees → always "Merchant Services Fee", always Y.
-Use "Other Income" or "Other Expense" only if truly unclear; explain in reason.
-
-── MERCHANT SERVICES DEPOSITS (critical rule) ──────────────────────────────
-ROYAL BANK CENTRAL CARD CENTRE, MONERIS, SQUARE, STRIPE, ELAVON, CHASE PAYMENTECH,
-GLOBAL PAYMENTS, TD MERCHANT SERVICES, and any similar payment processor name:
-  • direction = credit (money IN): This is a merchant services deposit — daily credit card
-    terminal settlement deposited into the business account. Category: "Merchant Services Deposit",
-    suggested_include: Y. NEVER classify these as credit card payments — they are INCOME.
-  • direction = debit (money OUT): This is a chargeback, fee, or reversal from the processor.
-    Category: "Merchant Services Fee", suggested_include: Y — these are legitimate business expenses.
-This rule is absolute — a deposit from ROYAL BANK CENTRAL CARD CENTRE is always income.
-
-── CONSISTENCY RULE (absolute) ─────────────────────────────────────────────
-Identical or near-identical descriptions must always get identical category and identical suggested_include.
-Before finalising, scan all transactions and fix any conflicts.
-
-── INCOME RULES (direction = credit) ───────────────────────────────────────
-
-Auto-set N:
-- Internal own-account transfers: keywords TFR-FR, transfer from own, same account holder → reason: Internal transfer — not external income.
-- SAME-NAME TRANSFERS (critical): If an e-transfer is received FROM a name that matches or closely resembles the account holder's own business or personal name, it is an internal transfer between the account holder's own accounts (e.g. chequing to savings). Set N, category "Internal Transfer", reason "Internal transfer between own accounts — excluded." Apply this even if the account holder name is not explicitly provided — look for the name that appears on the statement header.
-- NSF reversals and re-credits → reason: NSF reversal — not new income.
-- Government rebates: HST rebate, GST credit, Ontario Trillium Benefit → reason: Government rebate — excluded.
-- Wire transfers (any amount) → reason: Review: wire transfer — verify source and whether qualifying income.
-- Loan or LOC deposits: keywords loan, LOC, credit line, financing, advance, lendcare, or any lender name → reason: Review: possible loan deposit — verify if qualifying income.
-- Single deposit significantly larger than average deposits in this batch → reason: Review: unusually large deposit — verify source.
-- Returned outgoing e-transfers (sent out then returned) → reason: Returned outgoing e-transfer — not new income.
-
-Auto-set Y:
-- INTERAC e-transfers from clearly external senders.
-- ATM / mobile / cash / cheque deposits from third parties.
-- Regular recurring deposits that appear employment or business-related.
-- Direct deposits from known employers or processors (Square, Stripe, PayPal, etc.).
-- When uncertain, default Y and note in reason.
-
-── EXPENSE RULES (direction = debit) ───────────────────────────────────────
-
-Auto-set N — never override these rules:
-- ALL bank fees without exception: monthly plan fees, NSF fees, overdraft charges, overdraft per item charges, e-transfer fees, wire fees, service charges, transaction fees, draft fees, excess item fees → category: Bank Charges, reason: Bank fee — excluded.
-- Credit card payments: keywords MC, VISA, AMEX, MASTERCARD, CAN TIRE MC, TD VISA, CIBC VISA, RBC VISA, SCOTIA VISA, BMO MC, or any description combining a card brand with alphanumeric characters → reason: Credit card payment — excluded.
-- Transfers to own accounts at same or other institutions → reason: Internal transfer — excluded.
-- SAME-NAME TRANSFERS (critical): If an e-transfer is sent TO a name that matches or closely resembles the account holder's own business or personal name, it is an internal transfer to the account holder's own savings or other account. Set N, category "Internal Transfer", reason "Internal transfer between own accounts — excluded."
-- CRA, Receiver General, Canada Revenue Agency, or any government tax remittance: keywords CRA, CANADA REVENUE, RECEIVER GENERAL, HST REMIT, GST REMIT, TAX REMIT → category: CRA / Tax Remittance, reason: CRA / government tax remittance — excluded from qualifying expenses. This rule is absolute — never set Y for CRA or Receiver General payments.
-
-Auto-set Y:
-- Insurance payments.
-- Utilities: gas, hydro, internet, cable, phone, electricity.
-- Loan and mortgage payments to external lenders.
-- INTERAC e-transfers out to clearly external payees.
-- Cheques to third-party individuals or businesses.
-- Rent payments.
-- Debit card purchases at identifiable merchants.
-- Any regular, identifiable recurring expense.
-- When uncertain, default Y.
-
-── FLAGGING ────────────────────────────────────────────────────────────────
-Unusual, one-time, very large, or unclear transactions → start reason with "Review:" followed by concern.
-"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 1b — Claude vision extraction (image-based PDFs)
-# Used when PyMuPDF returns no text (scanned PDFs, image-rendered tables, etc.)
-# Combines extraction + categorisation in one call per page batch.
-# ─────────────────────────────────────────────────────────────────────────────
-
-IMAGE_EXTRACT_PROMPT = """You are a mortgage underwriting analyst reading bank statement images.
-
-Extract EVERY transaction visible in these images and return a JSON array.
-Skip only: opening balance rows, closing balance rows, total/subtotal rows, balance forward rows.
-IMPORTANT: If you see pages that show physical cheque images (handwritten or printed cheques),
-skip those pages entirely — do not extract amounts from cheque images.
-Only extract from pages showing a transaction table with Date | Description | Withdrawals | Deposits | Balance columns.
-Include every actual debit and credit — do not skip any from the transaction table.
-
-Each element of the array must have ALL these fields:
+If any of these four numbers isn't printed on this particular statement, omit that field
+rather than guessing. If no summary block exists at all, return an empty array.
+
+═══ transactions ═══
+Extract EVERY transaction in this statement.
+Skip only: opening balance rows, closing balance rows, "balance forward" rows,
+total/subtotal rows, and page-footer/legal boilerplate.
+Include every actual debit and credit exactly as printed, including recurring
+items that repeat every month (loan payments, lease payments, insurance,
+pre-authorized debits, bank fees) — do not assume a repeating item has
+already been captured; every occurrence on every date is a separate row.
+
+Each element must have ALL these fields:
 {
   "date": "YYYY-MM-DD",
   "description": "exact description text from statement",
@@ -1038,14 +347,18 @@ Each element of the array must have ALL these fields:
   "month": "Mon-YY",
   "category": "...",
   "suggested_include": "Y" or "N",
-  "reason": "brief reason, max 12 words"
+  "reason": "brief reason, max 12 words",
+  "source_page": 1
 }
 
 DIRECTION: Look at which column the amount appears in.
   Deposits / Credits column → "credit"  (money coming in)
   Withdrawals / Debits column → "debit"  (money going out)
 amount is always a positive number regardless of direction.
-month format example: Apr-24, Jan-25, Mar-26.
+month format example: Apr-24, Jan-25, Mar-26 — must match statement_periods[].period_label
+for the same calendar month.
+source_page: the 1-indexed page number (within this file) the transaction appears on —
+used only for audit reference, best effort.
 
 CATEGORIES: Use specific labels. Income: INTERAC e-Transfer In, Direct Deposit, Payroll Deposit,
 ATM Deposit, Cheque Deposit, Merchant Services Deposit, Wire Transfer In, or exact sender name.
@@ -1062,128 +375,244 @@ service charges, cheque image fees), credit card payments (VISA/MC/AMEX/Masterca
 own-account transfers, CRA/Receiver General/government tax payments (PAD CCRA, CRA Source Deduct, etc.).
 EXPENSE — Auto Y: insurance, utilities, loan payments, rent, identifiable merchant purchases,
 e-transfers out to external payees, cheques to third parties.
-
-Return ONLY valid JSON array. No prose, no markdown.
 """
 
 
-async def _extract_via_vision(pdf_bytes: bytes, filename: str,
-                              extra_context: str = "") -> list[dict]:
+AUDIT_LOG_DIR = os.environ.get("AUDIT_LOG_DIR", "./audit_logs")
+MAX_API_RETRIES = 3
+
+
+async def _call_claude_document(content: list[dict], filename: str, label: str):
     """
-    Fallback for image-based PDFs: render each page as PNG and send to Claude
-    vision for combined extraction + categorisation.
-    Returns fully-formed transaction dicts (already have category/include/reason).
+    Calls Claude with retries (exponential backoff) on transient errors.
+    Returns (response_text, stop_reason). stop_reason == "max_tokens" means
+    the response was truncated — the caller decides whether to re-split
+    and retry at a smaller page range.
     """
-    PAGES_PER_BATCH = 4
-    RENDER_SCALE    = 1.8   # zoom for readable resolution without huge file size
-
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
-    except Exception as e:
-        print(f"[WARN] Cannot open {filename} for vision: {e}")
-        return []
-
-    # Detect year from first page text (may still have text in header)
-    year = datetime.now().year
-    first_text = doc[0].get_text() if len(doc) > 0 else ""
-    m = YEAR_RE.search(first_text)
-    if m:
-        year = int(m.group(1))
-
-    # Render all pages
-    page_images: list[tuple[int, bytes]] = []
-    matrix = fitz.Matrix(RENDER_SCALE, RENDER_SCALE)
-    for page_num, page in enumerate(doc, 1):
-        try:
-            pix      = page.get_pixmap(matrix=matrix)
-            img_data = pix.tobytes("png")
-            page_images.append((page_num, img_data))
-        except Exception as e:
-            print(f"[WARN] Could not render page {page_num} of {filename}: {e}")
-    doc.close()
-
-    if not page_images:
-        print(f"[WARN] {filename}: no pages could be rendered")
-        return []
-
-    print(f"[INFO] {filename}: image-based PDF, {len(page_images)} pages → vision extraction")
-
-    all_transactions: list[dict] = []
-
-    for batch_start in range(0, len(page_images), PAGES_PER_BATCH):
-        batch = page_images[batch_start: batch_start + PAGES_PER_BATCH]
-
-        # Build multimodal message content
-        content: list[dict] = []
-        for page_num, img_bytes in batch:
-            content.append({"type": "text", "text": f"Page {page_num}:"})
-            content.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": base64.b64encode(img_bytes).decode(),
-                },
-            })
-        content.append({"type": "text", "text": IMAGE_EXTRACT_PROMPT + extra_context})
-
-        def _vision_call(c=content):
+    last_err = None
+    for attempt in range(1, MAX_API_RETRIES + 1):
+        def _call(c=content):
             return client.messages.create(
-                model="claude-haiku-4-5-20251001",
+                model="claude-sonnet-5",
                 max_tokens=16000,
                 messages=[{"role": "user", "content": c}],
-            ).content[0].text.strip()
-
+            )
         try:
-            response_text = await asyncio.to_thread(_vision_call)
-            batch_txs     = extract_json_transactions(response_text)
-            print(f"[INFO] {filename} vision batch pages "
-                  f"{batch[0][0]}-{batch[-1][0]}: {len(batch_txs)} transactions")
-
-            for tx in batch_txs:
-                # Normalise and fill required fields
-                direction = tx.get("direction", "debit").lower()
-                tx_type   = "income" if direction == "credit" else "expense"
-                amount    = abs(float(tx.get("amount", 0)))
-                signed    = amount if tx_type == "income" else -amount
-                inc_flag  = str(tx.get("suggested_include", "Y")).strip().upper() == "Y"
-
-                # Fix date year if Claude guessed wrong
-                date_str = tx.get("date", f"{year}-01-01")
-                if len(date_str) >= 4 and date_str[:4].isdigit():
-                    pass  # year already present
-                else:
-                    date_str = f"{year}-{date_str}"
-
-                # Fix month field
-                month_str = tx.get("month", "")
-                if not month_str:
-                    try:
-                        dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
-                        month_str = dt.strftime("%b-%y")
-                    except Exception:
-                        month_str = f"Unk-{str(year)[2:]}"
-
-                all_transactions.append({
-                    "id":               str(uuid.uuid4()),
-                    "date":             date_str[:10],
-                    "description":      tx.get("description", ""),
-                    "amount":           signed,
-                    "type":             tx_type,
-                    "month":            month_str,
-                    "category":         tx.get("category", "Other"),
-                    "suggested_include": tx.get("suggested_include", "Y"),
-                    "reason":           tx.get("reason", ""),
-                    "include":          inc_flag,
-                    "_vision":          True,   # flag: already categorised
-                })
-
+            response = await asyncio.to_thread(_call)
+            text = response.content[0].text.strip()
+            return text, response.stop_reason
         except Exception as e:
-            print(f"[WARN] Vision extraction failed for {filename} "
-                  f"pages {batch[0][0]}-{batch[-1][0]}: {e}")
+            last_err = e
+            if attempt < MAX_API_RETRIES:
+                wait = 2 ** attempt
+                print(f"[WARN] {filename} {label}: attempt {attempt}/{MAX_API_RETRIES} "
+                      f"failed ({e}) — retrying in {wait}s")
+                await asyncio.sleep(wait)
+            else:
+                print(f"[ERROR] {filename} {label}: failed after {MAX_API_RETRIES} "
+                      f"attempts: {e}")
+    raise last_err
 
-    print(f"[INFO] {filename}: vision complete — {len(all_transactions)} transactions")
-    return all_transactions
+
+def _save_audit_log(job_id: str, filename: str, label: str, response_text: str) -> None:
+    """
+    Persists the raw model response for this chunk so a disputed number can
+    be traced back to exactly what Claude returned, not just the final
+    parsed transaction. NOTE: this writes to local disk, which is fine for
+    local testing but will NOT survive a redeploy/restart on most hosting
+    platforms (e.g. Railway's filesystem is ephemeral). For production,
+    point AUDIT_LOG_DIR at a mounted volume, or swap this for an object-store
+    write (S3/GCS) — the call site doesn't need to change, just this function.
+    """
+    try:
+        job_dir = os.path.join(AUDIT_LOG_DIR, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        safe_name = re.sub(r'[^A-Za-z0-9_.-]', '_', f"{filename}_{label}")
+        with open(os.path.join(job_dir, f"{safe_name}.json"), "w") as f:
+            f.write(response_text)
+    except Exception as e:
+        print(f"[WARN] Could not write audit log for {filename} {label}: {e}")
+
+
+async def _extract_chunk(pdf_bytes: bytes, filename: str, extra_context: str,
+                          job_id: str, label: str, depth: int = 0) -> dict:
+    """
+    Extracts one page-chunk. If the response was truncated (hit max_tokens)
+    and the chunk has more than one page, splits it in half and recurses —
+    up to 2 levels deep — rather than silently accepting a partial result.
+    Returns {"statement_periods": [...], "transactions": [...]}.
+    """
+    content: list[dict] = [
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": base64.b64encode(pdf_bytes).decode(),
+            },
+        },
+        {"type": "text", "text": DOCUMENT_EXTRACT_PROMPT + extra_context},
+    ]
+
+    try:
+        response_text, stop_reason = await _call_claude_document(content, filename, label)
+    except Exception as e:
+        print(f"[WARN] {filename} {label}: giving up after retries — {e}")
+        return {"statement_periods": [], "transactions": []}
+
+    _save_audit_log(job_id, filename, label, response_text)
+
+    if stop_reason == "max_tokens":
+        page_count = 1
+        try:
+            with fitz.open(stream=pdf_bytes, filetype='pdf') as d:
+                page_count = len(d)
+        except Exception:
+            pass
+
+        if page_count > 1 and depth < 2:
+            print(f"[WARN] {filename} {label}: response truncated at {page_count} pages "
+                  f"— splitting in half and retrying")
+            halves = await asyncio.to_thread(_split_pdf_pages, pdf_bytes, max(page_count // 2, 1))
+            merged = {"statement_periods": [], "transactions": []}
+            for half_idx, half_bytes in enumerate(halves, 1):
+                half_result = await _extract_chunk(
+                    half_bytes, filename, extra_context, job_id,
+                    f"{label}.{half_idx}", depth + 1
+                )
+                merged["statement_periods"].extend(half_result["statement_periods"])
+                merged["transactions"].extend(half_result["transactions"])
+            return merged
+        else:
+            print(f"[WARN] {filename} {label}: response truncated and cannot split further "
+                  f"— using partial result (reconciliation will flag if incomplete)")
+
+    try:
+        return extract_json_full(response_text)
+    except ValueError as e:
+        print(f"[WARN] {filename} {label}: could not parse response — {e}")
+        return {"statement_periods": [], "transactions": []}
+
+
+def _split_pdf_pages(pdf_bytes: bytes, max_pages: int = 40) -> list[bytes]:
+    """Split a PDF into page-range chunks so each call to Claude stays well
+    under the API's per-document page/size limits. Statements under
+    max_pages come back as a single unmodified chunk."""
+    doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+    total = len(doc)
+    if total <= max_pages:
+        doc.close()
+        return [pdf_bytes]
+    chunks: list[bytes] = []
+    for start in range(0, total, max_pages):
+        end = min(start + max_pages, total)
+        sub = fitz.open()
+        sub.insert_pdf(doc, from_page=start, to_page=end - 1)
+        chunks.append(sub.write())
+        sub.close()
+    doc.close()
+    return chunks
+
+
+async def _extract_via_document(pdf_bytes: bytes, filename: str, job_id: str,
+                                 extra_context: str = "") -> dict:
+    """
+    Sends the PDF itself (not rendered page images) to Claude as a native
+    document content block. Preserves real text fidelity — no
+    rasterization/OCR step — and needs zero bank-specific code, so any bank
+    format, including ones never seen before, is handled the same way.
+
+    Returns {"transactions": [...fully-formed dicts...], "statement_periods": [...],
+    "reconciled": bool, "issues": [...]} — reconciliation runs automatically
+    against the statement's own printed totals before returning.
+    """
+    MAX_PAGES_PER_CALL = 40
+
+    try:
+        macro_chunks = await asyncio.to_thread(_split_pdf_pages, pdf_bytes, MAX_PAGES_PER_CALL)
+    except Exception as e:
+        print(f"[WARN] Could not inspect {filename} for document extraction: {e}")
+        macro_chunks = [pdf_bytes]
+
+    year = datetime.now().year
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+        first_text = doc[0].get_text() if len(doc) > 0 else ""
+        doc.close()
+        m = YEAR_RE.search(first_text)
+        if m:
+            year = int(m.group(1))
+    except Exception:
+        pass
+
+    print(f"[INFO] {filename}: reading PDF directly via Claude ({len(macro_chunks)} chunk(s))")
+
+    raw_transactions: list[dict] = []
+    raw_periods: list[dict] = []
+
+    for chunk_idx, chunk_bytes in enumerate(macro_chunks, 1):
+        result = await _extract_chunk(
+            chunk_bytes, filename, extra_context, job_id, f"chunk{chunk_idx}"
+        )
+        print(f"[INFO] {filename} chunk {chunk_idx}/{len(macro_chunks)}: "
+              f"{len(result['transactions'])} transactions, "
+              f"{len(result['statement_periods'])} statement period(s)")
+        raw_transactions.extend(result["transactions"])
+        raw_periods.extend(result["statement_periods"])
+
+    all_transactions: list[dict] = []
+    for tx in raw_transactions:
+        direction = tx.get("direction", "debit").lower()
+        tx_type   = "income" if direction == "credit" else "expense"
+        amount    = abs(float(tx.get("amount", 0)))
+        signed    = amount if tx_type == "income" else -amount
+        inc_flag  = str(tx.get("suggested_include", "Y")).strip().upper() == "Y"
+
+        date_str = tx.get("date", f"{year}-01-01")
+        if not (len(date_str) >= 4 and date_str[:4].isdigit()):
+            date_str = f"{year}-{date_str}"
+
+        month_str = tx.get("month", "")
+        if not month_str:
+            try:
+                dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
+                month_str = dt.strftime("%b-%y")
+            except Exception:
+                month_str = f"Unk-{str(year)[2:]}"
+
+        all_transactions.append({
+            "id":               str(uuid.uuid4()),
+            "date":             date_str[:10],
+            "description":      tx.get("description", ""),
+            "amount":           signed,
+            "type":             tx_type,
+            "month":            month_str,
+            "category":         tx.get("category", "Other"),
+            "suggested_include": tx.get("suggested_include", "Y"),
+            "reason":           tx.get("reason", ""),
+            "include":          inc_flag,
+            "source_page":      tx.get("source_page"),
+            "source_file":      filename,
+        })
+
+    reconciled, issues = reconcile_statement(raw_periods, all_transactions)
+    if not reconciled:
+        print(f"[WARN] {filename}: reconciliation FAILED — {len(issues)} issue(s)")
+        for issue in issues:
+            print(f"[WARN]   {filename}: {issue}")
+    else:
+        print(f"[INFO] {filename}: reconciled — extracted totals match the "
+              f"statement's own printed numbers for all {len(raw_periods)} period(s)")
+
+    print(f"[INFO] {filename}: document extraction complete — "
+          f"{len(all_transactions)} transactions")
+
+    return {
+        "transactions":      all_transactions,
+        "statement_periods": raw_periods,
+        "reconciled":        reconciled,
+        "issues":            issues,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1516,6 +945,19 @@ HTML = """<!DOCTYPE html>
           '<div class="sc-strip-cell"><div class="sc-strip-num">' + fmt(totals.expenses) + '</div><div class="sc-strip-lbl">Total Annual Expenses</div></div>' +
           '<div class="sc-strip-cell"><div class="sc-strip-num" style="color:' + (totals.net>=0?'#c4a050':'#e74c3c') + '">' + fmt(totals.net) + '</div><div class="sc-strip-lbl">Net Annual Income</div></div>' +
         '</div>' +
+        (state.progressInfo && state.progressInfo.needs_review
+          ? '<div style="background:#fdecea;border-bottom:2px solid #e74c3c;padding:12px 20px">' +
+              '<div style="max-width:1200px;margin:0 auto">' +
+                '<div style="font-size:13px;font-weight:700;color:#c0392b;margin-bottom:6px">' +
+                  '⚠️ ' + (state.progressInfo.reconciliation_issues||[]).length + ' reconciliation issue(s) — ' +
+                  'extracted totals don\'t match the statement\'s own printed numbers. Verify before relying on this report.' +
+                '</div>' +
+                '<ul style="margin:0;padding-left:18px;font-size:11px;color:#8a2f24">' +
+                  (state.progressInfo.reconciliation_issues||[]).slice(0,8).map(function(i){ return '<li>'+h(i)+'</li>'; }).join('') +
+                '</ul>' +
+              '</div>' +
+            '</div>'
+          : '') +
         '<div style="background:#fff;border-bottom:1px solid #e8e4dc;padding:12px 20px">' +
           '<div style="max-width:1200px;margin:0 auto;display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between">' +
             '<div style="display:flex;gap:4px;flex-wrap:wrap">' + filterBtns + '</div>' +
@@ -1905,42 +1347,26 @@ def health():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Background job: Stage 1 (Python extraction) → Stage 2 (Claude categorisation)
+# Background job: every file sent directly to Claude, processed concurrently
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
-    """
-    For each uploaded PDF:
-      Stage 1 — Python parser extracts exact structured transactions (no AI).
-      Stage 2 — Claude categorises in batches of 150; only assigns category,
-                 suggested_include, and reason — direction/amount already known.
-      Stage 3 — Python dedup pass normalises any cross-batch inconsistencies.
-    """
-    BATCH_SIZE   = 150
-    all_transactions: list[dict] = []
-    total_files = len(file_data)
+MAX_CONCURRENT_FILES = 3   # caps parallelism to stay well under API rate limits
 
-    try:
-        for file_idx, (filename, pdf_bytes) in enumerate(file_data):
-            jobs[job_id].update({
-                "current_file": f"File {file_idx+1}/{total_files}: {filename} — extracting transactions…",
-                "pages_done":   0,
-                "total_pages":  0,
-            })
 
-            # ── Stage 1a: Try Python text extraction ──────────────────────────
-            raw_txs = await asyncio.to_thread(
-                extract_transactions_from_pdf, pdf_bytes, filename
-            )
+async def _process_one_file(job_id: str, file_idx: int, total_files: int,
+                              filename: str, pdf_bytes: bytes,
+                              semaphore: asyncio.Semaphore) -> dict:
+    """Runs extraction + reconciliation for a single file. Returns a per-file
+    summary dict; never raises — a failed file becomes a warning, not a
+    crashed job, so one bad statement doesn't take down an entire batch."""
+    async with semaphore:
+        jobs[job_id]["files"][filename] = {"status": "processing"}
 
-            # Extract account holder name for same-name transfer detection
-            account_holder = await asyncio.to_thread(
-                _extract_account_holder, pdf_bytes
-            )
+        try:
+            account_holder = await asyncio.to_thread(_extract_account_holder, pdf_bytes)
             if account_holder:
                 print(f"[INFO] {filename}: account holder detected — '{account_holder}'")
 
-            # Build account-holder context injected into both prompts
             acct_context = ""
             if account_holder:
                 acct_context = (
@@ -1954,127 +1380,93 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
                     f"expense side (sent to own name). Never set Y for these.\n"
                 )
 
-            # ── Stage 1b: Fallback to Claude vision for image-based PDFs ─────
-            if not raw_txs:
-                jobs[job_id]["current_file"] = (
-                    f"File {file_idx+1}/{total_files}: {filename} — "
-                    f"⚠️ Scanned or image-based PDF detected. Reading with vision…"
-                )
-                vision_txs = await _extract_via_vision(
-                    pdf_bytes, filename, extra_context=acct_context
-                )
+            result = await _extract_via_document(
+                pdf_bytes, filename, job_id, extra_context=acct_context
+            )
 
-                if not vision_txs:
-                    print(f"[WARN] {filename}: could not extract transactions "
-                          f"via text or vision — skipping")
-                    continue
+            jobs[job_id]["files"][filename] = {
+                "status":           "done",
+                "transaction_count": len(result["transactions"]),
+                "reconciled":       result["reconciled"],
+                "issues":           result["issues"],
+            }
+            done_count = sum(
+                1 for f in jobs[job_id]["files"].values() if f["status"] in ("done", "error")
+            )
+            jobs[job_id]["pages_done"] = done_count
+            jobs[job_id]["current_file"] = (
+                f"{done_count}/{total_files} file(s) complete — most recently: "
+                f"{filename} ({len(result['transactions'])} transactions"
+                f"{', ⚠️ needs review' if not result['reconciled'] else ''})"
+            )
+            return result
 
-                # Vision transactions are already categorised — skip Stage 2
-                all_transactions.extend(vision_txs)
-                jobs[job_id].update({
-                    "pages_done":  1,
-                    "total_pages": 1,
-                    "current_file": (
-                        f"File {file_idx+1}/{total_files}: {filename} — "
-                        f"⚠️ Scanned PDF: {len(vision_txs)} transactions extracted via vision. "
-                        f"For higher accuracy, ask your client to re-download this statement "
-                        f"directly from their online banking portal."
-                    ),
-                })
-                print(f"[INFO] {filename}: vision path complete — "
-                      f"{len(vision_txs)} transactions")
-                continue
+        except Exception as e:
+            print(f"[ERROR] {filename}: extraction failed entirely — {e}")
+            jobs[job_id]["files"][filename] = {
+                "status": "error", "error": str(e),
+                "transaction_count": 0, "reconciled": False,
+                "issues": [f"File could not be processed: {e}"],
+            }
+            done_count = sum(
+                1 for f in jobs[job_id]["files"].values() if f["status"] in ("done", "error")
+            )
+            jobs[job_id]["pages_done"] = done_count
+            return {"transactions": [], "statement_periods": [], "reconciled": False,
+                    "issues": [f"File could not be processed: {e}"]}
 
-            # ── Stage 2: Claude categorisation (text-based PDFs only) ─────────
-            print(f"[INFO] {filename}: {len(raw_txs)} transactions ready for categorisation")
-            total_batches = (len(raw_txs) + BATCH_SIZE - 1) // BATCH_SIZE
-            jobs[job_id]["total_pages"] = total_batches
 
-            categorized: dict[str, dict] = {}
+async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
+    """
+    Every uploaded PDF is sent directly to Claude as a native document —
+    extraction, categorisation, and reconciliation against the statement's
+    own printed totals all happen per file. Files run concurrently (capped)
+    rather than one at a time.
+    """
+    total_files = len(file_data)
+    jobs[job_id]["files"] = {}
+    jobs[job_id]["total_pages"] = total_files
 
-            for batch_num, start in enumerate(range(0, len(raw_txs), BATCH_SIZE), 1):
-                batch = raw_txs[start: start + BATCH_SIZE]
-                jobs[job_id]["current_file"] = (
-                    f"File {file_idx+1}/{total_files}: {filename} — "
-                    f"categorising batch {batch_num}/{total_batches}…"
-                )
+    try:
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_FILES)
+        results = await asyncio.gather(*[
+            _process_one_file(job_id, idx, total_files, filename, pdf_bytes, semaphore)
+            for idx, (filename, pdf_bytes) in enumerate(file_data)
+        ])
 
-                batch_input = [
-                    {
-                        "id":          tx["id"],
-                        "description": tx["description"],
-                        "amount":      tx["amount"],
-                        "direction":   tx["direction"],
-                        "date":        tx["date"],
-                        "month":       tx["month"],
-                    }
-                    for tx in batch
-                ]
+        all_transactions: list[dict] = []
+        all_issues: list[str] = []
+        for filename, result in zip((f for f, _ in file_data), results):
+            all_transactions.extend(result["transactions"])
+            for issue in result["issues"]:
+                all_issues.append(f"{filename}: {issue}")
 
-                prompt = CAT_PROMPT + acct_context + "\n\nTransactions to categorise:\n" + json.dumps(batch_input)
-
-                def _call(p=prompt) -> str:
-                    with client.messages.stream(
-                        model="claude-haiku-4-5-20251001",
-                        max_tokens=16000,
-                        messages=[{"role": "user", "content": p}],
-                    ) as stream:
-                        return stream.get_final_text().strip()
-
-                try:
-                    response_text = await asyncio.to_thread(_call)
-                    results       = extract_json_transactions(response_text)
-                    for item in results:
-                        if "id" in item:
-                            categorized[item["id"]] = item
-                    print(f"[INFO] {filename} batch {batch_num}/{total_batches}: "
-                          f"{len(results)} categorised")
-                except Exception as e:
-                    print(f"[WARN] Claude error — {filename} batch {batch_num}: {e}")
-
-                jobs[job_id]["pages_done"] = batch_num
-
-            # ── Stage 3: Merge categorisation with extracted transactions ─────
-            file_transactions: list[dict] = []
-            for tx in raw_txs:
-                cat      = categorized.get(tx["id"], {})
-                tx_type  = "income" if tx["direction"] == "credit" else "expense"
-                inc_flag = str(cat.get("suggested_include", "Y")).strip().upper() == "Y"
-                signed   = abs(tx["amount"]) if tx_type == "income" else -abs(tx["amount"])
-
-                file_transactions.append({
-                    "id":               tx["id"],
-                    "date":             tx["date"],
-                    "description":      tx["description"],
-                    "amount":           signed,
-                    "type":             tx_type,
-                    "month":            tx["month"],
-                    "category":         cat.get("category", "Other"),
-                    "suggested_include": cat.get("suggested_include", "Y"),
-                    "reason":           cat.get("reason", ""),
-                    "include":          inc_flag,
-                })
-
-            all_transactions.extend(file_transactions)
-            print(f"[INFO] {filename}: complete — {len(file_transactions)} transactions merged")
-
-        # Dedup categories across all files for cross-batch consistency
         if all_transactions:
-            # Strip internal _vision flag before storing
             for tx in all_transactions:
                 tx.pop("_vision", None)
             all_transactions = deduplicate_categories(all_transactions)
 
-        session_id = str(uuid.uuid4())
-        sessions[session_id] = {"transactions": all_transactions}
+        needs_review = len(all_issues) > 0
+        session_id   = str(uuid.uuid4())
+        sessions[session_id] = {
+            "transactions":          all_transactions,
+            "needs_review":          needs_review,
+            "reconciliation_issues": all_issues,
+        }
         jobs[job_id].update({
-            "status":            "complete",
-            "session_id":        session_id,
-            "transaction_count": len(all_transactions),
-            "current_file":      f"Complete — {len(all_transactions)} transactions from {total_files} file(s)",
+            "status":              "complete",
+            "session_id":          session_id,
+            "transaction_count":   len(all_transactions),
+            "needs_review":        needs_review,
+            "reconciliation_issues": all_issues,
+            "current_file": (
+                f"Complete — {len(all_transactions)} transactions from {total_files} file(s)"
+                + (f" — ⚠️ {len(all_issues)} reconciliation issue(s), review before relying on this report"
+                   if needs_review else " — reconciled against statements' own printed totals")
+            ),
         })
         print(f"[INFO] Job {job_id} complete: {len(all_transactions)} transactions, "
-              f"session {session_id}")
+              f"needs_review={needs_review}, session {session_id}")
 
     except Exception as e:
         jobs[job_id] = {
@@ -2105,7 +1497,8 @@ async def analyze_statements(files: list[UploadFile] = File(...)):
         "status":      "processing",
         "current_file": f"Starting — 0 of {len(file_data)} files processed",
         "pages_done":  0,
-        "total_pages": 0,
+        "total_pages": len(file_data),
+        "files":       {},
     }
 
     task = asyncio.create_task(_process_job(job_id, file_data))
@@ -2125,10 +1518,13 @@ def get_job_status(job_id: str):
         "current_file": job.get("current_file", ""),
         "pages_done":   job.get("pages_done", 0),
         "total_pages":  job.get("total_pages", 0),
+        "files":        job.get("files", {}),
     }
     if job["status"] == "complete":
-        resp["session_id"]        = job["session_id"]
-        resp["transaction_count"] = job["transaction_count"]
+        resp["session_id"]           = job["session_id"]
+        resp["transaction_count"]    = job["transaction_count"]
+        resp["needs_review"]         = job.get("needs_review", False)
+        resp["reconciliation_issues"] = job.get("reconciliation_issues", [])
     elif job["status"] == "error":
         resp["error"] = job.get("error", "Unknown error")
     return resp
@@ -2499,6 +1895,46 @@ def export_excel(session_id: str):
     build_breakdown_sheet(ws_inc, income_txs)
     ws_exp = wb.create_sheet(EXP_SHEET)
     build_breakdown_sheet(ws_exp, expense_txs)
+
+    # ── Data Quality sheet — reconciliation against the statements' own
+    # printed totals travels with the actual deliverable, not just the API,
+    # since this is the file your team actually looks at.
+    needs_review          = sessions[session_id].get("needs_review", False)
+    reconciliation_issues = sessions[session_id].get("reconciliation_issues", [])
+
+    ws_dq = wb.create_sheet("Data Quality")
+    ws_dq.column_dimensions["A"].width = 100
+    row = 1
+    ws_dq.cell(row=row, column=1, value="Data Quality — Reconciliation Check").font = Font(name="Arial", bold=True, size=13)
+    row += 2
+    if needs_review:
+        c = ws_dq.cell(row=row, column=1,
+                        value=f"⚠️  {len(reconciliation_issues)} reconciliation issue(s) found — "
+                              f"extracted totals did not match the statements' own printed numbers. "
+                              f"Verify these before relying on this report.")
+        c.font = Font(name="Arial", bold=True, size=11, color="C0392B")
+        c.fill = PatternFill(start_color="FDECEA", end_color="FDECEA", fill_type="solid")
+        row += 2
+        ws_dq.cell(row=row, column=1, value="Issues:").font = bold_font
+        row += 1
+        for issue in reconciliation_issues:
+            ws_dq.cell(row=row, column=1, value=f"• {issue}").font = norm_font
+            row += 1
+    else:
+        c = ws_dq.cell(row=row, column=1,
+                        value="✓  Extracted totals matched the statements' own printed opening/closing "
+                              "balances and deposit/withdrawal totals for every statement period found. "
+                              "No reconciliation issues detected.")
+        c.font = Font(name="Arial", bold=True, size=11, color="27AE60")
+        c.fill = PatternFill(start_color="E8F8E8", end_color="E8F8E8", fill_type="solid")
+        row += 2
+
+    row += 1
+    ws_dq.cell(row=row, column=1,
+               value="Note: this check compares extracted transactions against the opening/closing "
+                     "balance and total deposits/withdrawals printed on each statement itself — it does "
+                     "not guarantee every individual transaction was categorised correctly, only that "
+                     "the totals for the period reconcile.").font = Font(name="Arial", size=9, italic=True, color="888888")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         tmp_path = tmp.name
