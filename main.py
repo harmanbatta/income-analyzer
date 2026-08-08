@@ -30,6 +30,49 @@ sessions: dict[str, dict] = {}
 jobs: dict[str, dict] = {}
 _running_tasks: set = set()
 
+YEAR_RE = re.compile(r'\b(20\d{2})\b')
+
+_KNOWN_BANK_NAMES = {
+    "cibc", "td canada trust", "td", "royal bank of canada", "rbc",
+    "bank of montreal", "bmo", "scotiabank", "the bank of nova scotia",
+    "affinity credit union", "affinity",
+}
+
+
+def _extract_account_holder(pdf_bytes: bytes) -> str:
+    """
+    Best-effort extraction of the account holder's name from the first page
+    of a bank statement. Used only to build an optional same-name
+    internal-transfer hint injected into the extraction prompt — an empty
+    result is fine and expected for statements where this heuristic doesn't
+    find a clean match; callers must never treat this as a hard requirement.
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+        text = doc[0].get_text() if len(doc) > 0 else ""
+        doc.close()
+    except Exception:
+        return ""
+
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    skip_markers = (
+        "account statement", "statement of account", "for the period",
+        "account number", "branch transit", "page ", "www.", "contact",
+        "transaction", "1 800", "tty ", "outside canada",
+    )
+    name_re = re.compile(r"^[A-Za-z0-9&.,'\-\s]{3,80}$")
+
+    for line in lines[:15]:
+        low = line.lower().rstrip(".")
+        if low in _KNOWN_BANK_NAMES:
+            continue
+        if any(marker in low for marker in skip_markers):
+            continue
+        if name_re.match(line) and any(c.isalpha() for c in line):
+            return line
+
+    return ""
+
 
 class UpdateTransactionRequest(BaseModel):
     include: bool
