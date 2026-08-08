@@ -537,22 +537,89 @@ async def _extract_chunk(pdf_bytes: bytes, filename: str, extra_context: str,
         return {"statement_periods": [], "transactions": []}
 
 
+STATEMENT_START_RE = re.compile(r'Page\s+1\s+of\s+\d+', re.IGNORECASE)
+
+
+def _find_statement_boundaries(doc) -> list[int]:
+    """
+    Returns the 0-indexed page numbers where a new monthly statement begins
+    within a merged multi-month PDF, detected via the "Page 1 of N"
+    pagination marker that appears on the first page of every statement in
+    the standard Canadian bank formats (CIBC, BMO, Scotia, RBC, TD, etc.).
+    Always includes page 0 and one-past-the-end. If the marker never
+    appears (single-statement file, or a non-standard layout), returns just
+    [0, len(doc)] so the caller falls back to naive fixed-size chunking.
+    """
+    boundaries = [0]
+    for i in range(1, len(doc)):
+        if STATEMENT_START_RE.search(doc[i].get_text()):
+            boundaries.append(i)
+    boundaries.append(len(doc))
+    return sorted(set(boundaries))
+
+
 def _split_pdf_pages(pdf_bytes: bytes, max_pages: int = 40) -> list[bytes]:
-    """Split a PDF into page-range chunks so each call to Claude stays well
+    """
+    Split a PDF into page-range chunks so each call to Claude stays well
     under the API's per-document page/size limits. Statements under
-    max_pages come back as a single unmodified chunk."""
+    max_pages come back as a single unmodified chunk.
+
+    Boundary-aware: a chunk boundary is never placed in the middle of one
+    monthly statement's pages. A naive fixed-size cut (e.g. every 40 pages)
+    can land mid-statement on a merged multi-month PDF — e.g. a 59-page,
+    12-month file cuts at page 40, which falls on page 4 of a 5-page March
+    statement, splitting March's transaction table across two separate
+    Claude calls. Worse, the second half never sees March's "Account
+    summary" box (opening/closing balance, printed totals), which lives on
+    March's page 1 in the first chunk — breaking reconciliation for that
+    month, or in the worst case corrupting extraction for the whole file.
+    Grouping whole statements into chunks (splitting only between
+    statements, never inside one) avoids this entirely.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype='pdf')
     total = len(doc)
     if total <= max_pages:
         doc.close()
         return [pdf_bytes]
+
+    boundaries = _find_statement_boundaries(doc)
     chunks: list[bytes] = []
-    for start in range(0, total, max_pages):
-        end = min(start + max_pages, total)
-        sub = fitz.open()
-        sub.insert_pdf(doc, from_page=start, to_page=end - 1)
-        chunks.append(sub.write())
-        sub.close()
+
+    if len(boundaries) <= 2:
+        # No internal "Page 1 of N" markers found anywhere — either a
+        # single long statement or a format this heuristic doesn't
+        # recognize. Fall back to the old naive fixed-size chunking rather
+        # than guessing at boundaries that aren't there.
+        for start in range(0, total, max_pages):
+            end = min(start + max_pages, total)
+            sub = fitz.open()
+            sub.insert_pdf(doc, from_page=start, to_page=end - 1)
+            chunks.append(sub.write())
+            sub.close()
+        doc.close()
+        return chunks
+
+    # Group consecutive whole statements together, never splitting one
+    # statement's pages across two chunks, while still keeping each chunk
+    # under max_pages (unless a single statement alone exceeds max_pages,
+    # in which case it becomes its own oversized chunk rather than being
+    # cut mid-statement).
+    statement_ranges = list(zip(boundaries[:-1], boundaries[1:]))
+    cur_start, cur_end = statement_ranges[0]
+    for s, e in statement_ranges[1:]:
+        if (e - cur_start) <= max_pages:
+            cur_end = e
+        else:
+            sub = fitz.open()
+            sub.insert_pdf(doc, from_page=cur_start, to_page=cur_end - 1)
+            chunks.append(sub.write())
+            sub.close()
+            cur_start, cur_end = s, e
+    sub = fitz.open()
+    sub.insert_pdf(doc, from_page=cur_start, to_page=cur_end - 1)
+    chunks.append(sub.write())
+    sub.close()
+
     doc.close()
     return chunks
 
