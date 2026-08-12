@@ -325,6 +325,503 @@ def reconcile_statement(statement_periods: list, transactions: list) -> tuple[bo
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TIERED EXTRACTION ROUTER
+#
+# Three ways to get transactions out of a file, cheapest-and-most-reliable
+# first. Every tier still ends at reconcile_statement() — nothing here
+# changes what "correct" means, only how cheaply we get there.
+#
+#   Tier 1 — CSV/XLSX (if the client provided one alongside the PDF):
+#            columns already tell us date/amount/direction directly.
+#            No AI needed for extraction, no column-guessing possible.
+#
+#   Tier 2 — Digital PDF, real text layer: pull text for free, work out
+#            each transaction's direction from the statement's own
+#            running balance (deterministic arithmetic — the same check
+#            that caught the Rome Transportation misclassification by
+#            hand). Only escalates to Tier 3 if this can't be validated
+#            against the statement's own printed totals.
+#
+#   Tier 3 — Scanned/image-only PDF, or Tier 2 failed validation: fall
+#            back to the existing Claude-vision pipeline unchanged.
+#
+# Tiers 1 and 2 never guess direction with a model — direction comes from
+# the data itself (an explicit column, or a balance delta). AI (Haiku,
+# cheap) is used only for the part that genuinely needs judgment:
+# deciding what a transaction IS (income vs. an excluded internal
+# transfer, which expense category it belongs to).
+# ─────────────────────────────────────────────────────────────────────────────
+
+STATEMENT_SUMMARY_LABEL_RE = {
+    # Non-greedy "any character including newlines" between the label and
+    # its value, rather than a "no digits" exclusion class -- the text
+    # between a label and its value often contains other digits (e.g.
+    # "Closing balance on Jul 31, 2025 = $8,847.56"), which a digit-
+    # excluding class would refuse to skip over.
+    #
+    # The sign is captured in its OWN group, before the optional $ -- a
+    # negative balance prints as "-$26.73" (minus before the dollar sign),
+    # not "$-26.73". Capturing "-?" only after "\$?" would let the minus
+    # sign get silently absorbed into the non-greedy skip instead of the
+    # value, turning a real overdraft into a positive number.
+    "opening_balance":   re.compile(r'opening\s+balance[\s\S]{0,60}?(-?)\$?\s*([\d,]+\.\d{2})', re.IGNORECASE),
+    "closing_balance":   re.compile(r'closing\s+balance[\s\S]{0,60}?(-?)\$?\s*([\d,]+\.\d{2})', re.IGNORECASE),
+    "total_deposits":    re.compile(r'deposits\b[\s\S]{0,20}?(-?)\$?\s*([\d,]+\.\d{2})', re.IGNORECASE),
+    "total_withdrawals": re.compile(r'withdrawals\b[\s\S]{0,20}?(-?)\$?\s*([\d,]+\.\d{2})', re.IGNORECASE),
+}
+
+# opening_balance/closing_balance can be genuinely negative (an overdrawn
+# account) -- the sign must be preserved. total_deposits/total_withdrawals
+# are always printed as positive magnitudes (any "-" near them is a visual
+# "this subtracts" marker, not part of the number) -- always take abs().
+_SUMMARY_FIELDS_KEEP_SIGN = {"opening_balance", "closing_balance"}
+
+# Recognizes a statement's own "For <Month> <day> to <Month> <day>, <year>"
+# period line, common across CIBC/BMO/Scotia/RBC/TD-style statements, so a
+# summary box can be labelled with the same "Mon-YY" format used elsewhere.
+PERIOD_LABEL_RE = re.compile(
+    r'for\s+\w+\s+\d{1,2}\s+to\s+(\w+)\s+\d{1,2},?\s*(\d{4})', re.IGNORECASE
+)
+
+# Per-transaction date line, e.g. "Jul 2", "Jul 15" -- the CIBC/BMO/Scotia
+# style used across every sample file seen so far. Extend this tuple with
+# more patterns as new bank formats are tested; a format this doesn't match
+# simply yields zero transactions, which fails validation and safely
+# escalates to Tier 3 rather than silently extracting nothing.
+DATE_LINE_RE = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})$')
+MONEY_LINE_RE = re.compile(r'^(-?)\$?([\d,]+\.\d{2})$')
+
+
+def _parse_money_line(line: str) -> Optional[float]:
+    m = MONEY_LINE_RE.match(line.replace('$', ''))
+    if not m:
+        return None
+    sign = -1 if m.group(1) == '-' else 1
+    return sign * float(m.group(2).replace(',', ''))
+
+
+def _is_scanned_pdf(pdf_bytes: bytes) -> bool:
+    """
+    True if this PDF has no meaningful extractable text layer (a genuine
+    scan/photo), in which case Tier 2's text parser has nothing to work
+    with and there's no point attempting it -- go straight to Tier 3
+    (Claude vision). Checked per-page rather than file-wide: a file mixing
+    real pages with a few scanned pages (seen before with RBC files) is
+    still treated as needing vision if enough of it is image-only.
+    """
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+        if len(doc) == 0:
+            return True
+        blank_pages = sum(1 for p in doc if len(p.get_text().strip()) < 40)
+        doc.close()
+        return (blank_pages / len(doc)) > 0.3
+    except Exception:
+        return True  # unreadable as a normal PDF -- treat as needing vision
+
+
+def _find_statement_summary_boxes(doc) -> list[dict]:
+    """
+    Best-effort extraction of each statement's own printed account-summary
+    box (opening/closing balance, total deposits/withdrawals) using plain
+    text + regex -- no AI, no vision. Segments the document using the same
+    "Page 1 of N" statement-boundary markers as _find_statement_boundaries,
+    then searches each statement's own pages for the four summary figures
+    and its period label.
+
+    This is intentionally permissive rather than bank-specific: it doesn't
+    need to know CIBC's exact layout, only that these four labelled dollar
+    figures appear somewhere near each other. If a bank's wording doesn't
+    match closely enough to find all four numbers, that statement simply
+    won't validate later in reconcile_statement() -- which is the signal
+    to fall back to Tier 3, not a wrong answer shipped silently.
+    """
+    boundaries = _find_statement_boundaries(doc)
+    periods = []
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        segment_text = "\n".join(doc[p].get_text() for p in range(start, min(end, start + 2)))
+        period = {}
+        for key, pattern in STATEMENT_SUMMARY_LABEL_RE.items():
+            m = pattern.search(segment_text)
+            if m:
+                try:
+                    sign_str, digits = m.group(1), m.group(2)
+                    value = float(digits.replace(',', ''))
+                    if sign_str == '-' and key in _SUMMARY_FIELDS_KEEP_SIGN:
+                        value = -value
+                    period[key] = value
+                except ValueError:
+                    pass
+        label_m = PERIOD_LABEL_RE.search(segment_text)
+        if label_m:
+            mon, yr = label_m.group(1)[:3], label_m.group(2)[-2:]
+            period["period_label"] = f"{mon}-{yr}"
+        if period.get("period_label") and len(period) > 1:
+            periods.append(period)
+    return periods
+
+
+def _parse_transactions_via_text(doc) -> list[dict]:
+    """
+    Reconstructs transactions directly from a PDF's text layer, using the
+    statement's own running balance to determine direction (credit if the
+    balance went up, debit if it went down) instead of trying to read
+    which visual column an amount sits in. This is the exact manual check
+    that caught the Rome Transportation misclassification -- generalized
+    to run automatically on every file, for free, with no AI involved.
+
+    Deliberately conservative: only emits a transaction when it can find
+    both an amount AND the resulting balance on consecutive lines. Rows it
+    can't confidently parse are simply skipped rather than guessed at --
+    a lower transaction count than the real statement fails validation
+    against the printed totals in reconcile_statement(), which is exactly
+    the signal to escalate to Tier 3 rather than ship a partial result.
+    """
+    boundaries = _find_statement_boundaries(doc)
+    year_guess = datetime.now().year
+    all_transactions: list[dict] = []
+
+    for seg_idx, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+        segment_text = "\n".join(doc[p].get_text() for p in range(start, end))
+        label_m = PERIOD_LABEL_RE.search(segment_text)
+        month_str, seg_year = None, year_guess
+        if label_m:
+            mon, yr_full = label_m.group(1)[:3], label_m.group(2)
+            month_str = f"{mon}-{yr_full[-2:]}"
+            seg_year = int(yr_full)
+
+        lines = [l.strip() for l in segment_text.split("\n") if l.strip()]
+        running_balance = None
+        current_date = None
+        desc_buffer: list[str] = []
+        started_table = False
+        i = 0
+        while i < len(lines):
+            l = lines[i]
+            if l.startswith("Transaction details"):
+                started_table = True; i += 1; continue
+            if not started_table:
+                i += 1; continue
+            if "Account summary" in l or l == "Opening balance":
+                i += 1; continue
+            dm = DATE_LINE_RE.match(l)
+            if dm:
+                current_date = f"{seg_year}-{dm.group(1)}-{dm.group(2)}"  # placeholder, fixed below
+                try:
+                    dt = datetime.strptime(f"{dm.group(2)} {dm.group(1)} {seg_year}", "%d %b %Y")
+                    current_date = dt.strftime("%Y-%m-%d")
+                except ValueError:
+                    pass
+                i += 1; continue
+            if l in ("Balance forward", "Closing balance"):
+                i += 1; continue
+            val = _parse_money_line(l)
+            if val is None:
+                desc_buffer.append(l); i += 1; continue
+            next_val = _parse_money_line(lines[i+1]) if i + 1 < len(lines) else None
+            if next_val is not None:
+                amount, new_balance = val, next_val
+                if running_balance is not None:
+                    delta = round(new_balance - running_balance, 2)
+                    direction = "credit" if delta > 0 else "debit"
+                    all_transactions.append({
+                        "date": current_date or f"{seg_year}-01-01",
+                        "description": " ".join(desc_buffer).strip(),
+                        "amount": round(abs(amount), 2),
+                        "direction": direction,
+                        "month": month_str or f"Unk-{str(seg_year)[2:]}",
+                        "source_page": start + 1,
+                    })
+                running_balance = new_balance
+                desc_buffer = []
+                i += 2
+            else:
+                running_balance = val
+                desc_buffer = []
+                i += 1
+
+    return all_transactions
+
+
+async def _categorize_via_haiku(raw_transactions: list[dict], extra_context: str) -> list[dict]:
+    """
+    Tier 1/2 categorization step. Direction and amount are already known
+    for certain (from CSV columns or balance-delta math) -- this call only
+    asks Haiku to decide category + include/exclude + reason, which is the
+    part that genuinely needs judgment. Much cheaper than Tier 3: plain
+    text in and out, no PDF pages, no vision, and the smaller model, since
+    "what kind of transaction is this" doesn't need Sonnet-level reasoning.
+    """
+    if not raw_transactions:
+        return []
+
+    lines_in = "\n".join(
+        f"{i}: {tx['date']} | {tx['direction']} | ${tx['amount']:.2f} | {tx['description']}"
+        for i, tx in enumerate(raw_transactions)
+    )
+    prompt = f"""Categorize each already-extracted bank transaction below for mortgage
+underwriting income analysis. Direction and amount are already correct and
+final -- do not change them. For each line, decide: category, whether to
+include it (Y/N), and a brief reason (max 12 words).
+
+{extra_context}
+
+CATEGORIES: Use specific labels. Income: INTERAC e-Transfer In, Direct Deposit, Payroll Deposit,
+ATM Deposit, Cheque Deposit, Merchant Services Deposit, Wire Transfer In, or exact sender name.
+Expense: exact payee name or type such as INTERAC e-Transfer Out, Cheque, Mortgage Payment,
+Loan Payment, CC Transfer, Cash Withdrawal, Bank Charges, Merchant Services Fee.
+
+INCOME — Auto N: own-account internal transfers, wire transfers (add "Review:" prefix),
+government rebates (HST/GST credit, OTB), loan/LOC deposits, returned e-transfers, unusually large deposits.
+INCOME — Auto Y: external e-transfers, payroll deposits, direct deposits, merchant card settlements,
+ATM/cash/cheque deposits from third parties.
+
+EXPENSE — Auto N (never override): ALL bank fees (monthly fees, NSF, overdraft, e-transfer fees,
+service charges, cheque image fees), credit card payments (VISA/MC/AMEX/Mastercard bill payments),
+own-account transfers, CRA/Receiver General/government tax payments (PAD CCRA, CRA Source Deduct, etc.).
+EXPENSE — Auto Y: insurance, utilities, loan payments, rent, identifiable merchant purchases,
+e-transfers out to external payees, cheques to third parties.
+
+TRANSACTIONS (index: date | direction | amount | description):
+{lines_in}
+
+Return ONLY a JSON array, one object per line above, in the same order:
+[{{"index": 0, "category": "...", "suggested_include": "Y", "reason": "..."}}]
+"""
+
+    last_exc = None
+    for attempt in range(1, MAX_API_RETRIES + 1):
+        try:
+            def _call():
+                return client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=8000,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            response = await asyncio.to_thread(_call)
+            text_blocks = [b.text for b in response.content if getattr(b, "type", None) == "text"]
+            if not text_blocks:
+                raise ValueError("No text block in Haiku categorization response")
+            text = "".join(text_blocks).strip()
+            categorized = extract_json_transactions(text)
+            by_index = {c["index"]: c for c in categorized if "index" in c}
+            merged = []
+            for i, tx in enumerate(raw_transactions):
+                c = by_index.get(i, {})
+                merged_tx = dict(tx)
+                merged_tx["category"] = c.get("category", "Other")
+                merged_tx["suggested_include"] = c.get("suggested_include", "Y")
+                merged_tx["reason"] = c.get("reason", "")
+                merged.append(merged_tx)
+            return merged
+        except Exception as e:
+            last_exc = e
+            if attempt < MAX_API_RETRIES:
+                await asyncio.sleep(2 * attempt)
+    raise RuntimeError(f"Haiku categorization failed after {MAX_API_RETRIES} attempts: {last_exc}")
+
+
+_CSV_COLUMN_ALIASES = {
+    "date":        {"date", "transaction date", "posted date", "posting date"},
+    "description": {"description", "details", "memo", "narrative", "transaction", "payee"},
+    "amount":      {"amount", "transaction amount"},
+    "debit":       {"debit", "withdrawal", "withdrawals", "money out", "out"},
+    "credit":      {"credit", "deposit", "deposits", "money in", "in"},
+    "balance":     {"balance", "running balance", "account balance"},
+}
+
+
+def _map_csv_columns(header: list[str]) -> dict[str, int]:
+    mapping: dict[str, int] = {}
+    normalized = [h.strip().lower() for h in header]
+    for field, aliases in _CSV_COLUMN_ALIASES.items():
+        for idx, h in enumerate(normalized):
+            if h in aliases:
+                mapping[field] = idx
+                break
+    return mapping
+
+
+def _parse_csv_or_excel(file_bytes: bytes, filename: str) -> list[dict]:
+    """
+    Tier 1 parser. Reads a client-provided CSV/XLSX export directly --
+    columns already state date/amount/direction, so there's no column- or
+    balance-guessing involved at all. Handles three common export shapes:
+      (a) separate Debit and Credit columns (direction is which one is non-empty)
+      (b) a single signed Amount column (negative = debit, positive = credit)
+      (c) an unsigned Amount column + a running Balance column (falls back
+          to the same balance-delta logic as Tier 2)
+    Rows that don't fit any of these are skipped, not guessed at -- same
+    philosophy as Tier 2: fewer transactions than reality fails
+    reconciliation and surfaces as a review flag, rather than a silent
+    wrong answer.
+    """
+    import csv, io
+
+    if filename.lower().endswith((".xlsx", ".xls")):
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        ws = wb.active
+        rows = [[("" if c is None else str(c)) for c in row] for row in ws.iter_rows(values_only=True)]
+    else:
+        text = file_bytes.decode("utf-8-sig", errors="replace")
+        rows = list(csv.reader(io.StringIO(text)))
+
+    if not rows:
+        return []
+
+    header_idx = 0
+    mapping = {}
+    for idx, row in enumerate(rows[:5]):
+        m = _map_csv_columns(row)
+        if "date" in m and ("amount" in m or "debit" in m or "credit" in m):
+            header_idx, mapping = idx, m
+            break
+    if not mapping:
+        return []
+
+    running_balance = None
+    transactions = []
+    for row in rows[header_idx + 1:]:
+        if len(row) <= max(mapping.values()):
+            continue
+
+        def cell(field):
+            idx = mapping.get(field)
+            return row[idx].strip() if idx is not None and idx < len(row) else ""
+
+        date_raw, desc = cell("date"), cell("description")
+        if not date_raw:
+            continue
+
+        def to_amt(s):
+            s = s.replace("$", "").replace(",", "").strip()
+            if not s:
+                return None
+            try:
+                return float(s)
+            except ValueError:
+                return None
+
+        debit, credit = to_amt(cell("debit")), to_amt(cell("credit"))
+        amount, balance = to_amt(cell("amount")), to_amt(cell("balance"))
+
+        direction, amt = None, None
+        if debit is not None and debit != 0:
+            direction, amt = "debit", abs(debit)
+        elif credit is not None and credit != 0:
+            direction, amt = "credit", abs(credit)
+        elif amount is not None and balance is not None:
+            if running_balance is not None:
+                delta = round(balance - running_balance, 2)
+                direction = "credit" if delta > 0 else "debit"
+                amt = abs(amount)
+            running_balance = balance
+        elif amount is not None:
+            direction = "credit" if amount > 0 else "debit"
+            amt = abs(amount)
+
+        if direction is None or amt is None:
+            continue
+
+        parsed_date = date_raw
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%b %d, %Y", "%d-%b-%Y"):
+            try:
+                parsed_date = datetime.strptime(date_raw, fmt).strftime("%Y-%m-%d")
+                break
+            except ValueError:
+                continue
+
+        month_str = parsed_date[:7]
+        try:
+            month_str = datetime.strptime(parsed_date[:10], "%Y-%m-%d").strftime("%b-%y")
+        except ValueError:
+            pass
+
+        transactions.append({
+            "date": parsed_date[:10],
+            "description": desc,
+            "amount": round(amt, 2),
+            "direction": direction,
+            "month": month_str,
+            "source_page": None,
+        })
+
+    return transactions
+
+
+def _normalize_raw_transactions(raw_transactions: list[dict], filename: str) -> list[dict]:
+    """Applies the same direction→type/sign normalization used for the
+    Tier 3 vision path, so Tier 1/2 output is identical in shape."""
+    normalized = []
+    for tx in raw_transactions:
+        direction = tx.get("direction", "debit").lower()
+        tx_type = "income" if direction == "credit" else "expense"
+        amount = abs(float(tx.get("amount", 0)))
+        signed = amount if tx_type == "income" else -amount
+        inc_flag = str(tx.get("suggested_include", "Y")).strip().upper() == "Y"
+        normalized.append({
+            "id":               str(uuid.uuid4()),
+            "date":             tx.get("date", ""),
+            "description":      tx.get("description", ""),
+            "amount":           signed,
+            "type":             tx_type,
+            "month":            tx.get("month", ""),
+            "category":         tx.get("category", "Other"),
+            "suggested_include": tx.get("suggested_include", "Y"),
+            "reason":           tx.get("reason", ""),
+            "include":          inc_flag,
+            "source_page":      tx.get("source_page"),
+            "source_file":      filename,
+        })
+    return normalized
+
+
+async def _extract_via_csv_tier(pdf_bytes: bytes, csv_bytes: bytes, csv_filename: str,
+                                  filename: str, extra_context: str) -> dict:
+    """Tier 1: parse the client-provided CSV/XLSX for transactions, but still
+    use the companion PDF's own printed summary box (free text parse, no
+    vision) as the reconciliation target -- so a doctored CSV would be
+    caught the same way a misread PDF would."""
+    raw = _parse_csv_or_excel(csv_bytes, csv_filename)
+    doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+    periods = _find_statement_summary_boxes(doc)
+    doc.close()
+
+    categorized = await _categorize_via_haiku(raw, extra_context)
+    transactions = _normalize_raw_transactions(categorized, filename)
+    reconciled, issues = reconcile_statement(periods, transactions)
+    return {"transactions": transactions, "statement_periods": periods,
+            "reconciled": reconciled, "issues": issues, "tier": "csv"}
+
+
+async def _extract_via_text_tier(pdf_bytes: bytes, filename: str, extra_context: str) -> Optional[dict]:
+    """Tier 2: free text + balance-math extraction. Returns None (not a
+    result dict) if it can't validate against the statement's own printed
+    totals, signalling the caller to fall back to Tier 3 instead of
+    accepting an unverified result."""
+    doc = fitz.open(stream=pdf_bytes, filetype='pdf')
+    periods = _find_statement_summary_boxes(doc)
+    raw = _parse_transactions_via_text(doc)
+    doc.close()
+
+    if not raw or not periods:
+        return None
+
+    prelim = _normalize_raw_transactions(
+        [{**tx, "category": "Other", "suggested_include": "Y"} for tx in raw], filename
+    )
+    reconciled, _ = reconcile_statement(periods, prelim)
+    if not reconciled:
+        return None  # escalate to Tier 3 -- don't ship an unverified result
+
+    categorized = await _categorize_via_haiku(raw, extra_context)
+    transactions = _normalize_raw_transactions(categorized, filename)
+    reconciled, issues = reconcile_statement(periods, transactions)
+    return {"transactions": transactions, "statement_periods": periods,
+            "reconciled": reconciled, "issues": issues, "tier": "text_parser"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Extraction: every uploaded PDF is sent directly to Claude as a native
 # document (see _extract_via_document below). No bank-specific parsers.
 #
@@ -1479,7 +1976,9 @@ MAX_CONCURRENT_FILES = 3   # caps parallelism to stay well under API rate limits
 
 async def _process_one_file(job_id: str, file_idx: int, total_files: int,
                               filename: str, pdf_bytes: bytes,
-                              semaphore: asyncio.Semaphore) -> dict:
+                              semaphore: asyncio.Semaphore,
+                              csv_bytes: Optional[bytes] = None,
+                              csv_filename: Optional[str] = None) -> dict:
     """Runs extraction + reconciliation for a single file. Returns a per-file
     summary dict; never raises — a failed file becomes a warning, not a
     crashed job, so one bad statement doesn't take down an entire batch."""
@@ -1504,9 +2003,38 @@ async def _process_one_file(job_id: str, file_idx: int, total_files: int,
                     f"expense side (sent to own name). Never set Y for these.\n"
                 )
 
-            result = await _extract_via_document(
-                pdf_bytes, filename, job_id, extra_context=acct_context
-            )
+            result = None
+            tier_tried = "vision"
+            if csv_bytes is not None:
+                print(f"[INFO] {filename}: CSV/XLSX provided ({csv_filename}) — using Tier 1 (CSV)")
+                try:
+                    result = await _extract_via_csv_tier(
+                        pdf_bytes, csv_bytes, csv_filename, filename, acct_context
+                    )
+                    tier_tried = "csv"
+                except Exception as e:
+                    print(f"[WARN] {filename}: Tier 1 (CSV) failed ({e}) — falling back to Tier 2/3")
+
+            if result is None and not _is_scanned_pdf(pdf_bytes):
+                print(f"[INFO] {filename}: attempting Tier 2 (free text parser)")
+                try:
+                    result = await _extract_via_text_tier(pdf_bytes, filename, acct_context)
+                    if result is not None:
+                        tier_tried = "text_parser"
+                    else:
+                        print(f"[INFO] {filename}: Tier 2 could not be validated — "
+                              f"falling back to Tier 3 (Claude vision)")
+                except Exception as e:
+                    print(f"[WARN] {filename}: Tier 2 failed ({e}) — falling back to Tier 3")
+
+            if result is None:
+                print(f"[INFO] {filename}: using Tier 3 (Claude vision)")
+                result = await _extract_via_document(
+                    pdf_bytes, filename, job_id, extra_context=acct_context
+                )
+                tier_tried = "vision"
+
+            print(f"[INFO] {filename}: extraction tier used — {tier_tried}")
 
             jobs[job_id]["files"][filename] = {
                 "status":           "done",
@@ -1547,20 +2075,36 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
     own printed totals all happen per file. Files run concurrently (capped)
     rather than one at a time.
     """
-    total_files = len(file_data)
+    pdf_files_preview = [(fn, b) for fn, b in file_data if fn.lower().endswith(".pdf")]
+    total_files = len(pdf_files_preview)
     jobs[job_id]["files"] = {}
     jobs[job_id]["total_pages"] = total_files
 
     try:
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_FILES)
+        pdf_files = pdf_files_preview
+        companion_files = {
+            fn: b for fn, b in file_data
+            if fn.lower().endswith((".csv", ".xlsx", ".xls"))
+        }
+
+        def _stem(name: str) -> str:
+            return os.path.splitext(name)[0].lower()
+
+        companion_by_stem = {_stem(fn): (fn, b) for fn, b in companion_files.items()}
+
         results = await asyncio.gather(*[
-            _process_one_file(job_id, idx, total_files, filename, pdf_bytes, semaphore)
-            for idx, (filename, pdf_bytes) in enumerate(file_data)
+            _process_one_file(
+                job_id, idx, total_files, filename, pdf_bytes, semaphore,
+                csv_bytes=companion_by_stem.get(_stem(filename), (None, None))[1],
+                csv_filename=companion_by_stem.get(_stem(filename), (None, None))[0],
+            )
+            for idx, (filename, pdf_bytes) in enumerate(pdf_files)
         ])
 
         all_transactions: list[dict] = []
         all_issues: list[str] = []
-        for filename, result in zip((f for f, _ in file_data), results):
+        for filename, result in zip((f for f, _ in pdf_files), results):
             all_transactions.extend(result["transactions"])
             for issue in result["issues"]:
                 all_issues.append(f"{filename}: {issue}")
@@ -1611,9 +2155,16 @@ async def _process_job(job_id: str, file_data: list[tuple[str, bytes]]):
 async def analyze_statements(files: list[UploadFile] = File(...)):
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
+    ALLOWED_EXTS = (".pdf", ".csv", ".xlsx", ".xls")
     for file in files:
-        if not file.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail=f"{file.filename} is not a PDF")
+        if not file.filename.lower().endswith(ALLOWED_EXTS):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{file.filename} must be a PDF, or a CSV/XLSX with the same "
+                       f"filename as its companion PDF (e.g. 'Statement.pdf' + 'Statement.csv')"
+            )
+    if not any(f.filename.lower().endswith(".pdf") for f in files):
+        raise HTTPException(status_code=400, detail="At least one PDF is required")
 
     file_data = [(f.filename, await f.read()) for f in files]
     job_id    = str(uuid.uuid4())
